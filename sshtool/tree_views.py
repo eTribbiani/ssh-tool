@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .config import file_type, format_mtime, format_size
+from .icons import get_icon
 
 
 class LocalFileProxyModel(QSortFilterProxyModel):
@@ -126,18 +127,25 @@ class DragDropTreeView(QTreeView):
         self.setDefaultDropAction(Qt.CopyAction)
         self._role = "local"  # "local" 或 "remote"
         self._drop_target = QModelIndex()  # 拖放悬停的目标目录(用于高亮)
+        self._fallback_root_path = ""  # 远程面板无 setRootIndex 时的回退根路径
 
     def set_role(self, role: str):
         self._role = role
 
-    def _path_for_index(self, idx: QModelIndex) -> str:
-        """将视图索引映射为文件系统路径（兼容代理模型与标准模型）"""
+    def set_fallback_root_path(self, path: str):
+        """设置回退根路径（用于远程面板未设置 rootIndex 时的右键菜单）"""
+        self._fallback_root_path = path
+
+    def _unwind_index(self, idx: QModelIndex):
+        """将代理模型索引解包为 (source_model, source_idx)"""
         model = self.model()
         if isinstance(model, QAbstractProxyModel):
-            src_model = model.sourceModel()
-            src_idx = model.mapToSource(idx)
-        else:
-            src_model, src_idx = model, idx
+            return model.sourceModel(), model.mapToSource(idx)
+        return model, idx
+
+    def _path_for_index(self, idx: QModelIndex) -> str:
+        """将视图索引映射为文件系统路径（兼容代理模型与标准模型）"""
+        src_model, src_idx = self._unwind_index(idx)
         if isinstance(src_model, QFileSystemModel):
             return src_model.filePath(src_idx)
         item = src_model.itemFromIndex(src_idx)
@@ -145,12 +153,7 @@ class DragDropTreeView(QTreeView):
 
     def _is_dir_item(self, idx: QModelIndex) -> bool:
         """判断索引对应的是否为目录"""
-        model = self.model()
-        if isinstance(model, QAbstractProxyModel):
-            src_model = model.sourceModel()
-            src_idx = model.mapToSource(idx)
-        else:
-            src_model, src_idx = model, idx
+        src_model, src_idx = self._unwind_index(idx)
         if isinstance(src_model, QFileSystemModel):
             return src_model.isDir(src_idx)
         item = src_model.itemFromIndex(src_idx)
@@ -299,48 +302,86 @@ class DragDropTreeView(QTreeView):
         idx = self.indexAt(event.pos())
         selected_indexes = self.selectionModel().selectedRows()
 
-        # 收集当前面板的根路径（用于"新建文件夹"的默认父目录）
-        root_path = self._path_for_index(self.rootIndex()) if self.rootIndex().isValid() else ""
+        # 收集根路径：优先 rootIndex，回退到 fallback（远程面板未设置 rootIndex）
+        if self.rootIndex().isValid():
+            root_path = self._path_for_index(self.rootIndex())
+        else:
+            root_path = self._fallback_root_path
 
         if idx.isValid():
             clicked_path = self._path_for_index(idx)
+
+            # 跳过占位符项（如"加载中..."无路径数据）
+            if not clicked_path:
+                menu.addAction(
+                    get_icon("refresh-cw", size=16, color="#a9b1d6"),
+                    "刷新",
+                    lambda: self.context_refresh.emit(),
+                )
+                menu.exec_(event.globalPos())
+                return
+
+            # ── 右键点击了非当前选中的项 → 清除旧选区，选中当前项 ──
+            if idx not in selected_indexes:
+                self.selectionModel().select(idx, self.selectionModel().ClearAndSelect)
+                selected_indexes = [idx]
+
             is_dir = self._is_dir_item(idx)
 
             # ── 多选时仅支持删除 ──
-            if len(selected_indexes) > 1 and idx in selected_indexes:
+            if len(selected_indexes) > 1:
                 selected_paths = [self._path_for_index(i) for i in selected_indexes]
                 selected_paths = [p for p in selected_paths if p]
                 if selected_paths:
-                    del_action = menu.addAction("删除选中项")
+                    del_action = menu.addAction(
+                        get_icon("trash-2", size=16, color="#c0caf5"),
+                        f"删除 {len(selected_paths)} 个选中项",
+                    )
                     del_action.triggered.connect(
-                        lambda: self.context_delete.emit(selected_paths))
+                        lambda sp=selected_paths: self.context_delete.emit(sp))
                 menu.addSeparator()
-                menu.addAction("刷新", lambda: self.context_refresh.emit())
+                menu.addAction(
+                    get_icon("refresh-cw", size=16, color="#a9b1d6"),
+                    "刷新",
+                    lambda: self.context_refresh.emit(),
+                )
                 menu.exec_(event.globalPos())
                 return
 
             # ── 单项操作 ──
-            if is_dir:
-                # 点击目录: 新建文件夹在目录内创建
-                parent_for_new = clicked_path
-                menu.addAction("新建文件夹", lambda: self.context_new_folder.emit(parent_for_new))
-                menu.addSeparator()
-                menu.addAction("重命名", lambda: self.context_rename.emit(clicked_path))
-                menu.addAction("删除", lambda: self.context_delete.emit([clicked_path]))
-            else:
-                # 点击文件: 新建文件夹在父目录中创建
-                parent_dir = os.path.dirname(clicked_path) if clicked_path else root_path
-                menu.addAction("新建文件夹", lambda: self.context_new_folder.emit(parent_dir))
-                menu.addSeparator()
-                menu.addAction("重命名", lambda: self.context_rename.emit(clicked_path))
-                menu.addAction("删除", lambda: self.context_delete.emit([clicked_path]))
+            parent_for_new = clicked_path if is_dir else os.path.dirname(clicked_path)
+
+            menu.addAction(
+                get_icon("folder-plus", size=16, color="#a9b1d6"),
+                "新建文件夹",
+                lambda p=parent_for_new: self.context_new_folder.emit(p),
+            )
+            menu.addSeparator()
+            menu.addAction(
+                get_icon("pencil", size=16, color="#a9b1d6"),
+                "重命名",
+                lambda p=clicked_path: self.context_rename.emit(p),
+            )
+            menu.addAction(
+                get_icon("trash-2", size=16, color="#c0caf5"),
+                "删除",
+                lambda p=clicked_path: self.context_delete.emit([p]),
+            )
         else:
             # 点击空白区域: 新建文件夹在当前根目录
             if root_path:
-                menu.addAction("新建文件夹", lambda: self.context_new_folder.emit(root_path))
+                menu.addAction(
+                    get_icon("folder-plus", size=16, color="#a9b1d6"),
+                    "新建文件夹",
+                    lambda p=root_path: self.context_new_folder.emit(p),
+                )
 
         menu.addSeparator()
-        menu.addAction("刷新", lambda: self.context_refresh.emit())
+        menu.addAction(
+            get_icon("refresh-cw", size=16, color="#a9b1d6"),
+            "刷新",
+            lambda: self.context_refresh.emit(),
+        )
         menu.exec_(event.globalPos())
 
 

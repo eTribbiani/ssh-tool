@@ -21,7 +21,7 @@ from .dialogs import ConfigDialog, RsyncOptionsDialog, TransferPreviewDialog
 from .icons import get_icon
 from .remote_fs import RemoteFileSystemModel
 from .rsync_options import RsyncOptions
-from .ssh_utils import TunnelConnector, run_ssh, test_tunnel_flow
+from .ssh_utils import RemoteCommandWorker, TunnelConnector, run_ssh, test_tunnel_flow
 from .tasks import CANCELLED, DONE, FAILED, TransferQueue
 from .transfer_engine import TransferEngine
 from .tree_views import DragDropTreeView, DiffHighlightDelegate, DiffStatus, LocalFileProxyModel, RemoteFileFilterProxy
@@ -388,6 +388,8 @@ class MainWindow(QMainWindow):
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setFont(QFont("DejaVu Sans Mono", 13))
+        # 限制日志文档块数, 防止长时间会话内存无限增长
+        self.log_view.document().setMaximumBlockCount(2000)
         self._bottom_tabs.addTab(self.log_view, "日志")
 
         # 主布局：工具栏 → 垂直分割器(双栏树 / 底部面板可上下拉伸)
@@ -500,6 +502,7 @@ class MainWindow(QMainWindow):
     def _load_remote_path(self, path: str):
         """加载远程路径作为面板根目录（硬刷新）"""
         self._tree_root_path = path
+        self.remote_tree.set_fallback_root_path(path)
         self.remote_path_bar.setText(path)
         self._remote_fs.set_root_path(path)
         self.remote_tree.expandAll()
@@ -659,6 +662,22 @@ class MainWindow(QMainWindow):
         """完全重置远程树（硬刷新）—— 路径栏回车时使用"""
         self._load_remote_path(self.remote_path_bar.text().strip())
 
+    def _refresh_remote_dir(self, path: str):
+        """局部刷新指定远程目录，保留树展开状态。
+        若路径不在当前树中则回退到硬刷新 _load_remote_path。
+        """
+        item = self._remote_fs.find_item_for_path(path)
+        if item is not None and self._remote_fs.is_dir(item):
+            self._remote_fs.refresh_directory(path, item)
+            self._log(f"已刷新远程目录: {path}")
+        elif self._is_tree_root_path(path):
+            self._remote_fs.refresh_directory(
+                path, self._remote_fs.model.invisibleRootItem()
+            )
+            self._log(f"已刷新根目录: {path}")
+        else:
+            self._load_remote_path(path)
+
     def _remote_refresh_current(self):
         """刷新当前远程目录，保留整棵树的展开状态（软刷新）。
 
@@ -669,24 +688,13 @@ class MainWindow(QMainWindow):
         回退到硬刷新 _load_remote_path。
         """
         path = self.remote_path_bar.text().strip()
-        if not path or not self._tunnel_connected:
+        if not path:
+            return
+        if not self._tunnel_connected:
+            self._log("⚠ 远程面板刷新失败: 隧道未连接")
             return
 
-        item = self._remote_fs.find_item_for_path(path)
-        if item is not None and self._remote_fs.is_dir(item):
-            # 路径是树中已展开的子目录 → 局部刷新
-            self._remote_fs.refresh_directory(path, item)
-            self._log(f"已刷新目录: {path}")
-        elif self._is_tree_root_path(path):
-            # 路径就是树的根 → 使用 invisibleRootItem 刷新
-            self._remote_fs.refresh_directory(
-                path, self._remote_fs.model.invisibleRootItem()
-            )
-            self._log(f"已刷新根目录: {path}")
-        else:
-            # 路径不在当前树中 → 回退到硬刷新
-            self._load_remote_path(path)
-
+        self._refresh_remote_dir(path)
         self._update_diff_highlighting()
 
     def _is_tree_root_path(self, path: str) -> bool:
@@ -754,11 +762,31 @@ class MainWindow(QMainWindow):
 
     # ─── 右键上下文菜单 ─────────────────────────────────────
 
+    # --- 共享 helper --------------------------------------------------
+
+    def _prompt_name(self, title: str, label: str, default: str = ""):
+        """弹出名称输入对话框，返回非空名称或 None"""
+        name, ok = QInputDialog.getText(self, title, label, QLineEdit.Normal, default)
+        name = name.strip() if ok else ""
+        return name if name else None
+
+    def _check_tunnel_alive(self) -> bool:
+        """检查隧道连接状态；断开时弹出警告并返回 False"""
+        if not self._tunnel_connected:
+            QMessageBox.warning(self, "提示", "请先连接远程隧道")
+            return False
+        return True
+
+    @staticmethod
+    def _ssh_error_text(result) -> str:
+        """从 subprocess.CompletedProcess 中提取可读错误文本"""
+        return result.stderr.strip() if result.stderr else "未知错误"
+
+    # --- 本地操作 ----------------------------------------------------
+
     def _local_context_new_folder(self, parent_path: str):
         """在本地指定目录中新建文件夹"""
-        name, ok = QInputDialog.getText(
-            self, "新建文件夹", "文件夹名称:", QLineEdit.Normal, "")
-        name = name.strip() if ok else ""
+        name = self._prompt_name("新建文件夹", "文件夹名称:")
         if not name:
             return
         new_path = os.path.join(parent_path, name)
@@ -774,9 +802,7 @@ class MainWindow(QMainWindow):
     def _local_context_rename(self, old_path: str):
         """重命名本地文件或目录"""
         old_name = os.path.basename(old_path)
-        name, ok = QInputDialog.getText(
-            self, "重命名", "新名称:", QLineEdit.Normal, old_name)
-        name = name.strip() if ok else ""
+        name = self._prompt_name("重命名", "新名称:", default=old_name)
         if not name or name == old_name:
             return
         new_path = os.path.join(os.path.dirname(old_path), name)
@@ -810,59 +836,67 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "错误", f"删除失败:\n{p}\n{e}")
         self._local_refresh()
 
+    # --- 远程操作（异步，不阻塞 GUI）--------------------------------
+
     def _remote_context_new_folder(self, parent_path: str):
         """在远程指定目录中新建文件夹"""
-        if not self._tunnel_connected:
-            QMessageBox.warning(self, "提示", "请先连接远程隧道")
+        if not self._check_tunnel_alive():
             return
-        name, ok = QInputDialog.getText(
-            self, "新建文件夹", "文件夹名称:", QLineEdit.Normal, "")
-        name = name.strip() if ok else ""
+        name = self._prompt_name("新建文件夹", "文件夹名称:")
         if not name:
             return
         remote_path = f"{parent_path.rstrip('/')}/{name}"
-        cmd = f"mkdir -p {shlex.quote(remote_path)}"
-        try:
-            result = run_ssh(self._config, cmd)
-            if result.returncode == 0:
-                self._log(f"✓ 已创建远程目录: {remote_path}")
-                self._remote_refresh_current()
-            else:
-                QMessageBox.critical(
-                    self, "错误",
-                    f"创建远程目录失败:\n{result.stderr.strip() or '未知错误'}")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{e}")
+        # 不使用 mkdir -p：目录已存在时应报错（与本地行为一致）
+        cmd = f"mkdir {shlex.quote(remote_path)}"
+        self._log(f"⏳ 正在创建远程目录: {remote_path}")
+
+        worker = RemoteCommandWorker(self._config, cmd, parent=self)
+        worker.finished.connect(
+            lambda r, rp=remote_path: self._on_remote_mkdir_done(r, rp))
+        worker.error.connect(
+            lambda e: QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{e}"))
+        worker.start()
+
+    def _on_remote_mkdir_done(self, result, remote_path: str):
+        if result.returncode == 0:
+            self._log(f"✓ 已创建远程目录: {remote_path}")
+        else:
+            QMessageBox.critical(self, "错误",
+                                 f"创建远程目录失败:\n{self._ssh_error_text(result)}")
+        self._remote_refresh_current()
 
     def _remote_context_rename(self, old_path: str):
         """重命名远程文件或目录"""
-        if not self._tunnel_connected:
-            QMessageBox.warning(self, "提示", "请先连接远程隧道")
+        if not self._check_tunnel_alive():
             return
-        old_name = os.path.basename(old_path)
-        name, ok = QInputDialog.getText(
-            self, "重命名", "新名称:", QLineEdit.Normal, old_name)
-        name = name.strip() if ok else ""
+        # 远程路径使用字符串操作，不使用 os.path（避免平台差异）
+        old_name = old_path.rsplit("/", 1)[-1] if "/" in old_path else old_path
+        name = self._prompt_name("重命名", "新名称:", default=old_name)
         if not name or name == old_name:
             return
-        new_path = os.path.join(os.path.dirname(old_path), name)
+        parent_dir = old_path.rsplit("/", 1)[0] if "/" in old_path else ""
+        new_path = f"{parent_dir}/{name}" if parent_dir else name
         cmd = f"mv {shlex.quote(old_path)} {shlex.quote(new_path)}"
-        try:
-            result = run_ssh(self._config, cmd)
-            if result.returncode == 0:
-                self._log(f"✓ 已重命名: {old_name} → {name}")
-                self._remote_refresh_current()
-            else:
-                QMessageBox.critical(
-                    self, "错误",
-                    f"重命名失败:\n{result.stderr.strip() or '未知错误'}")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{e}")
+        self._log(f"⏳ 正在重命名: {old_name} → {name}")
+
+        worker = RemoteCommandWorker(self._config, cmd, parent=self)
+        worker.finished.connect(
+            lambda r, on=old_name, nn=name: self._on_remote_rename_done(r, on, nn))
+        worker.error.connect(
+            lambda e: QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{e}"))
+        worker.start()
+
+    def _on_remote_rename_done(self, result, old_name: str, new_name: str):
+        if result.returncode == 0:
+            self._log(f"✓ 已重命名: {old_name} → {new_name}")
+        else:
+            QMessageBox.critical(self, "错误",
+                                 f"重命名失败:\n{self._ssh_error_text(result)}")
+        self._remote_refresh_current()
 
     def _remote_context_delete(self, paths: list):
         """删除远程文件或目录（含确认对话框）"""
-        if not self._tunnel_connected:
-            QMessageBox.warning(self, "提示", "请先连接远程隧道")
+        if not self._check_tunnel_alive():
             return
         if not paths:
             return
@@ -874,19 +908,24 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-        for p in paths:
-            # 使用 rm -rf 以同时处理文件和目录
-            cmd = f"rm -rf {shlex.quote(p)}"
-            try:
-                result = run_ssh(self._config, cmd)
-                if result.returncode == 0:
-                    self._log(f"✓ 已删除远程项目: {p}")
-                else:
-                    QMessageBox.critical(
-                        self, "错误",
-                        f"删除失败:\n{p}\n{result.stderr.strip() or '未知错误'}")
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{p}\n{e}")
+        # 合并为单次 SSH 命令，避免 N 次往返
+        quoted = " ".join(shlex.quote(p) for p in paths)
+        cmd = f"rm -rf {quoted}"
+        self._log(f"⏳ 正在删除 {len(paths)} 个远程项目...")
+
+        worker = RemoteCommandWorker(self._config, cmd, timeout=30, parent=self)
+        worker.finished.connect(
+            lambda r, cnt=len(paths): self._on_remote_delete_done(r, cnt))
+        worker.error.connect(
+            lambda e: QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{e}"))
+        worker.start()
+
+    def _on_remote_delete_done(self, result, count: int):
+        if result.returncode == 0:
+            self._log(f"✓ 已删除 {count} 个远程项目")
+        else:
+            QMessageBox.critical(self, "错误",
+                                 f"删除失败:\n{self._ssh_error_text(result)}")
         self._remote_refresh_current()
 
     # ─── 传输请求 ─────────────────────────────────────────────
@@ -1021,7 +1060,20 @@ class MainWindow(QMainWindow):
         self.task_list.addItem(item)
         self.task_list.setItemWidget(item, row)
         self._task_rows[task.id] = row
+        self._trim_task_list()
         self._update_task_tab_label()
+
+    def _trim_task_list(self):
+        """限制任务列表行数, 移除最旧行以控制内存"""
+        limit = 100
+        while self.task_list.count() > limit:
+            item = self.task_list.takeItem(0)
+            widget = self.task_list.itemWidget(item)
+            if widget:
+                for tid, row in list(self._task_rows.items()):
+                    if row is widget:
+                        del self._task_rows[tid]
+                widget.deleteLater()
 
     def _on_task_started(self, task):
         row = self._task_rows.get(task.id)
@@ -1075,27 +1127,14 @@ class MainWindow(QMainWindow):
         避免原本展开的树状结构瞬间闭合。
         """
         if direction == "push" and dest:
-            # 推送 → 刷新远程目标目录
-            item = self._remote_fs.find_item_for_path(dest)
-            if item is not None and self._remote_fs.is_dir(item):
-                self._remote_fs.refresh_directory(dest, item)
-                self._log(f"已刷新远程目录: {dest}")
-            elif self._is_tree_root_path(dest):
-                # 目标路径是树的根
-                self._remote_fs.refresh_directory(
-                    dest, self._remote_fs.model.invisibleRootItem()
-                )
-                self._log(f"已刷新根目录: {dest}")
-            else:
-                # 目标目录不在当前树中，回退刷新当前路径栏目录
-                self._remote_refresh_current()
+            self._refresh_remote_dir(dest)
         elif direction == "pull" and dest:
-            # 拉取 → 刷新本地当前目录
             self._local_refresh()
         else:
-            # 回退：刷新远程当前目录
             if self._tunnel_connected:
-                self._remote_refresh_current()
+                path = self.remote_path_bar.text().strip()
+                if path:
+                    self._refresh_remote_dir(path)
 
         self._update_diff_highlighting()
 

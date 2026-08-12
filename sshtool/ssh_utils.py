@@ -130,6 +130,28 @@ def remote_listing(config: dict, path: str) -> list:
         return []
 
 
+class RemoteCommandWorker(QThread):
+    """后台执行远程 SSH 命令，不阻塞 GUI"""
+
+    finished = pyqtSignal(object)       # subprocess.CompletedProcess
+    error = pyqtSignal(str)             # 错误消息
+
+    def __init__(self, cfg: dict, remote_cmd: str, timeout: int = 15, parent=None):
+        super().__init__(parent)
+        self._cfg = cfg
+        self._cmd = remote_cmd
+        self._timeout = timeout
+
+    def run(self):
+        try:
+            result = run_ssh(self._cfg, self._cmd, timeout=self._timeout)
+            self.finished.emit(result)
+        except subprocess.TimeoutExpired:
+            self.error.emit("远程命令执行超时")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class TunnelConnector(QThread):
     """后台建立并验证 SSH 隧道(含根目录列表预取), 不阻塞 GUI"""
 
