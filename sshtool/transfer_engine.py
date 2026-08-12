@@ -2,6 +2,7 @@
 
 import re
 import subprocess
+from typing import Iterable
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -99,7 +100,9 @@ class TransferEngine(QThread):
             f"-o StrictHostKeyChecking=no"
         )
 
-        rsync_args = ["rsync"] + self.rsync_opts.to_args()
+        # --outbuf=L: rsync 行缓冲输出, 每条进度即时刷新, 避免 stdio 整块缓冲
+        # 导致进度"长时间卡死, 然后瞬间 100%" (需 rsync >= 3.1.0)
+        rsync_args = ["rsync", "--outbuf=L"] + self.rsync_opts.to_args()
         if self.dry_run:
             rsync_args.append("--dry-run")
         rsync_args.extend(["-e", ssh_cmd])
@@ -126,18 +129,14 @@ class TransferEngine(QThread):
                 text=True, bufsize=1,
             )
 
-            for line in self._rsync_proc.stdout:
+            # 按 \r 或 \n 实时拆分输出(rsync 非 tty 模式下进度以 \r 刷新)
+            for line in self._iter_output_lines(self._rsync_proc.stdout.buffer):
                 if self._cancelled:
                     self._rsync_proc.terminate()
                     self._emit_log("⊗ 传输已取消")
                     self.transfer_done.emit(False, "用户取消传输")
                     return False
-
-                line = line.strip()
-                if line:
-                    pct = self._parse_progress(line)
-                    self.transfer_progress.emit(line, pct)
-                    self._emit_log(f"  {line}")
+                self._process_output(line)
 
             self._rsync_proc.wait()
 
@@ -167,6 +166,36 @@ class TransferEngine(QThread):
                 if total > 0:
                     return int(done / total * 100)
         return -1
+
+    @staticmethod
+    def _iter_output_lines(stream) -> Iterable[str]:
+        """将 rsync 输出按 \n 或 \r 实时拆分为完整更新行。
+
+        用 read1 读原始块(一次底层读, 有数据即返回, 不会等待填满缓冲),
+        再按 \r/\n 双分隔符拆分: rsync 在非 tty 模式下进度更新以 \r 分隔,
+        仅按行读取会一直等到换行或进程结束才能拿到数据, 造成进度
+        "长时间卡死, 然后瞬间 100%"。
+        """
+        buf = ""
+        for chunk in iter(lambda: stream.read1(4096), b""):
+            buf += chunk.decode(errors="replace")
+            parts = re.split(r"[\r\n]", buf)
+            buf = parts.pop()
+            for part in parts:
+                yield part
+        if buf.strip():
+            yield buf
+
+    def _process_output(self, line: str):
+        """处理一条输出: 实时推送进度条, 进度刷新行不写入日志避免刷屏"""
+        line = line.strip()
+        if not line:
+            return
+        pct = self._parse_progress(line)
+        self.transfer_progress.emit(line, pct)
+        # 进度刷新行形如 " 5,308,416  25%    4.88MB/s    0:00:03", 仅用于进度显示
+        if "%" not in line or ("/s" not in line and "xfr#" not in line):
+            self._emit_log(f"  {line}")
 
     def _emit_log(self, msg: str):
         self.log_message.emit(msg)

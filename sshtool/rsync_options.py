@@ -13,6 +13,7 @@ class RsyncOptions:
     compress: bool = True
     delete: bool = True
     progress: bool = True
+    ignore_existing: bool = False
 
     exclude_git: bool = True
     exclude_build: bool = True
@@ -61,6 +62,8 @@ class RsyncOptions:
             args.append("--delete")
         if self.progress:
             args.append("--info=progress2")
+        if self.ignore_existing:
+            args.append("--ignore-existing")
 
         for attr, pattern in EXCLUDE_PATTERNS:
             if getattr(self, attr):
@@ -84,8 +87,9 @@ class RsyncOptions:
     def summary(self) -> str:
         """简短摘要"""
         parts = [f for f, on in zip(
-            ["-a", "-v", "-z", "--delete"],
-            [self.archive, self.verbose, self.compress, self.delete],
+            ["-a", "-v", "-z", "--delete", "--ignore-existing"],
+            [self.archive, self.verbose, self.compress,
+             self.delete, self.ignore_existing],
         ) if on]
         if not parts:
             return "无选项"

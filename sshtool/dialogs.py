@@ -54,6 +54,12 @@ class RsyncOptionsDialog(QDialog):
         dest_label.setStyleSheet("color: #6cb6ff;")
         s_layout.addRow("目标:", dest_label)
 
+        # 覆盖策略: 随选项实时更新
+        self.strategy_label = QLabel()
+        self.strategy_label.setWordWrap(True)
+        self.strategy_label.setStyleSheet("color: #6cb6ff;")
+        s_layout.addRow("覆盖策略:", self.strategy_label)
+
         layout.addWidget(summary_group)
 
         # ── Rsync 选项 ──
@@ -79,6 +85,11 @@ class RsyncOptionsDialog(QDialog):
             cb.toggled.connect(self._on_option_toggled)
             basic_layout.addWidget(cb)
         opts_layout.addWidget(basic_group)
+
+        # 安全选项: 跳过已存在的目标文件
+        self.cb_ignore_existing = QCheckBox("--ignore-existing (跳过已存在的目标文件)")
+        self.cb_ignore_existing.toggled.connect(self._on_option_toggled)
+        opts_layout.addWidget(self.cb_ignore_existing)
 
         exclude_group = QGroupBox("排除项")
         exclude_layout = QHBoxLayout(exclude_group)
@@ -133,13 +144,25 @@ class RsyncOptionsDialog(QDialog):
         if factory:
             self._apply_options(factory())
 
+    def _update_strategy(self, opts: RsyncOptions):
+        """更新覆盖策略说明文字"""
+        if opts.ignore_existing:
+            text = "跳过目标端已存在的文件，不覆盖 (--ignore-existing)"
+        elif opts.delete:
+            text = "覆盖/更新已存在的文件，并删除目标端多余文件 (--delete)"
+        else:
+            text = "覆盖/更新已存在的文件"
+        self.strategy_label.setText(text)
+
     def _on_option_toggled(self):
         if self._building:
             return
         # 检查当前选项是否匹配某个预设
+        opts = self._collect_options()
+        self._update_strategy(opts)
         self._building = True
         self.preset_combo.blockSignals(True)
-        self.preset_combo.setCurrentText(self._match_preset(self._collect_options()))
+        self.preset_combo.setCurrentText(self._match_preset(opts))
         self.preset_combo.blockSignals(False)
         self._building = False
 
@@ -149,6 +172,7 @@ class RsyncOptionsDialog(QDialog):
         self.cb_verbose.setChecked(opts.verbose)
         self.cb_compress.setChecked(opts.compress)
         self.cb_delete.setChecked(opts.delete)
+        self.cb_ignore_existing.setChecked(opts.ignore_existing)
 
         for attr, cb in self._exclude_checks.items():
             cb.setChecked(getattr(opts, attr))
@@ -156,6 +180,7 @@ class RsyncOptionsDialog(QDialog):
         self.custom_input.setText(", ".join(opts.custom_excludes))
         self._building = False
 
+        self._update_strategy(opts)
         self.preset_combo.setCurrentText(self._match_preset(opts))
 
     def _collect_options(self) -> RsyncOptions:
@@ -167,6 +192,7 @@ class RsyncOptionsDialog(QDialog):
             verbose=self.cb_verbose.isChecked(),
             compress=self.cb_compress.isChecked(),
             delete=self.cb_delete.isChecked(),
+            ignore_existing=self.cb_ignore_existing.isChecked(),
             **{attr: cb.isChecked() for attr, cb in self._exclude_checks.items()},
             custom_excludes=custom,
         )

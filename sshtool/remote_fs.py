@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QStandardItem, QStandardItemModel
 from PyQt5.QtWidgets import QApplication, QStyle
 
-from .config import file_type, format_mtime
+from .config import file_type, format_mtime, format_size
 from .ssh_utils import run_ssh
 
 
@@ -77,7 +77,7 @@ class RemoteFileSystemModel:
         name_item.setEditable(False)
 
         # 大小列
-        size_text = self._format_size(size) if size > 0 and not is_dir else ("—" if not is_dir else "")
+        size_text = format_size(size) if size > 0 and not is_dir else ("—" if not is_dir else "")
         size_item = QStandardItem(size_text)
         size_item.setEditable(False)
         size_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -145,16 +145,6 @@ class RemoteFileSystemModel:
         return entries
 
     @staticmethod
-    def _format_size(size: int) -> str:
-        if size <= 0:
-            return ""
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} TB"
-
-    @staticmethod
     def _format_mtime(mtime: int) -> str:
         """将 Unix 时间戳转为统一可读格式"""
         if mtime <= 0:
@@ -169,3 +159,50 @@ class RemoteFileSystemModel:
 
     def has_children_cached(self, path: str) -> bool:
         return path in self._cache
+
+    def refresh_directory(self, path: str, parent_item: QStandardItem):
+        """刷新单个目录缓存并重新加载子节点，不清除整棵树。
+
+        与 expand_directory 不同，此方法始终失效缓存并重新获取远程列表，
+        即使该路径已在 _cache 中。用于传输完成后的局部刷新和 F5 手动刷新。
+        """
+        if path in self._loading_paths:
+            return
+        self._loading_paths.add(path)
+        try:
+            self._cache.pop(path, None)  # 失效此目录的缓存
+            # 级联失效所有子目录缓存，否则重建的子目录 item 带有
+            # "加载中..." 占位符，但 has_children_cached 返回 True，
+            # 懒加载守卫会阻止重新获取，导致子目录永远卡在占位符状态。
+            prefix = path.rstrip("/") + "/"
+            for k in list(self._cache.keys()):
+                if k.startswith(prefix):
+                    del self._cache[k]
+            parent_item.removeRows(0, parent_item.rowCount())
+            self._populate_directory(path, parent_item)
+        finally:
+            self._loading_paths.discard(path)
+
+    def find_item_for_path(self, path: str) -> Optional[QStandardItem]:
+        """在模型树中递归查找指定远程路径对应的 item。
+
+        通过 UserRole 中存储的 full_path 匹配。用于定位需要局部刷新的目录节点。
+        返回 None 表示该路径不在当前树中（可能是根路径本身，或还未加载）。
+        """
+        norm = path.rstrip("/") or "/"
+
+        def search(parent: QStandardItem) -> Optional[QStandardItem]:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                if not child:
+                    continue
+                child_path = (self.get_full_path(child) or "").rstrip("/")
+                if child_path == norm:
+                    return child
+                if self.is_dir(child):
+                    found = search(child)
+                    if found is not None:
+                        return found
+            return None
+
+        return search(self.model.invisibleRootItem())

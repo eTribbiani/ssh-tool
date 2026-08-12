@@ -1,6 +1,7 @@
 """MainWindow — 主窗口与程序入口"""
 
 import os
+import shutil
 import sys
 import time
 from typing import Optional
@@ -39,6 +40,9 @@ class MainWindow(QMainWindow):
         self._transfer_engine: Optional[TransferEngine] = None
         self._local_paths = set()    # 本地选中缓存
         self._remote_paths = set()   # 远程选中缓存
+        self._last_transfer_dest: str = ""
+        self._last_transfer_direction: str = ""
+        self._tree_root_path: str = ""
 
         # 字体大小
         self._font_size = clamp_font(self._config.get("font_size", 25))
@@ -204,7 +208,7 @@ class MainWindow(QMainWindow):
         remote_nav.setSpacing(2)
         self.remote_up_btn = self._make_nav_btn("⬆", "上一级", self._remote_go_up)
         self.remote_root_btn = self._make_nav_btn("⌂", "根目录", self._remote_go_root)
-        self.remote_refresh_btn = self._make_nav_btn("↻", "刷新", self._remote_refresh)
+        self.remote_refresh_btn = self._make_nav_btn("↻", "刷新当前目录 (F5)", self._remote_refresh_current)
         remote_nav.addWidget(self.remote_up_btn)
         remote_nav.addWidget(self.remote_root_btn)
         remote_nav.addWidget(self.remote_refresh_btn)
@@ -318,7 +322,8 @@ class MainWindow(QMainWindow):
         self.local_path_bar.setText(path)
 
     def _load_remote_path(self, path: str):
-        """加载远程路径作为面板根目录"""
+        """加载远程路径作为面板根目录（硬刷新）"""
+        self._tree_root_path = path
         self.remote_path_bar.setText(path)
         self._remote_fs.set_root_path(path)
         self.remote_tree.expandAll()
@@ -357,7 +362,42 @@ class MainWindow(QMainWindow):
         self._load_remote_path(self._config["rk_base_path"])
 
     def _remote_refresh(self):
+        """完全重置远程树（硬刷新）—— 路径栏回车时使用"""
         self._load_remote_path(self.remote_path_bar.text().strip())
+
+    def _remote_refresh_current(self):
+        """刷新当前远程目录，保留整棵树的展开状态（软刷新）。
+
+        仅失效当前路径栏目录的缓存并重新获取其子节点，
+        不清除其他目录的缓存。由 F5 快捷键和刷新按钮触发。
+
+        若当前路径不在模型树中（既不是根也不是已展开的子目录），
+        回退到硬刷新 _load_remote_path。
+        """
+        path = self.remote_path_bar.text().strip()
+        if not path or not self._tunnel_connected:
+            return
+
+        item = self._remote_fs.find_item_for_path(path)
+        if item is not None and self._remote_fs.is_dir(item):
+            # 路径是树中已展开的子目录 → 局部刷新
+            self._remote_fs.refresh_directory(path, item)
+            self._log(f"已刷新目录: {path}")
+        elif self._is_tree_root_path(path):
+            # 路径就是树的根 → 使用 invisibleRootItem 刷新
+            self._remote_fs.refresh_directory(
+                path, self._remote_fs.model.invisibleRootItem()
+            )
+            self._log(f"已刷新根目录: {path}")
+        else:
+            # 路径不在当前树中 → 回退到硬刷新
+            self._load_remote_path(path)
+
+    def _is_tree_root_path(self, path: str) -> bool:
+        """判断给定路径是否为当前树的根路径"""
+        root = self._tree_root_path.rstrip("/") or "/"
+        target = path.rstrip("/") or "/"
+        return root == target
 
     def _on_local_double_click(self, index: QModelIndex):
         src_index = self._local_proxy.mapToSource(index)
@@ -370,10 +410,16 @@ class MainWindow(QMainWindow):
         if item is None or not self._remote_fs.is_dir(item):
             return
         path = self._remote_fs.get_full_path(item)
-        self.remote_path_bar.setText(path)
-        if not self._remote_fs.has_children_cached(path):
-            self._remote_fs.expand_directory(path, item)
-        self.remote_tree.expand(index)
+
+        if self.remote_tree.isExpanded(index):
+            # 已展开 → 折叠
+            self.remote_tree.collapse(index)
+        else:
+            # 未展开 → 加载并展开
+            self.remote_path_bar.setText(path)
+            if not self._remote_fs.has_children_cached(path):
+                self._remote_fs.expand_directory(path, item)
+            self.remote_tree.expand(index)
 
     def _on_remote_expanded(self, index: QModelIndex):
         item = self._remote_fs.model.itemFromIndex(index)
@@ -453,6 +499,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "已有传输在进行中")
             return
 
+        # 记录传输目标，用于完成后局部刷新
+        self._last_transfer_dest = dest
+        self._last_transfer_direction = direction
+
         # 确保隧道已连接
         if not self._tunnel_connected:
             self._log("隧道未连接，正在自动连接...")
@@ -503,11 +553,46 @@ class MainWindow(QMainWindow):
         if success:
             self.progress_bar.setValue(100)
             self.status_bar.showMessage("✓ 传输完成", 5000)
-            # 刷新远程目录
-            self._remote_refresh()
+            # 局部刷新受影响的目录，保留树展开状态
+            self._refresh_after_transfer()
         else:
             self.progress_bar.setValue(0)
             self.status_bar.showMessage(f"✗ {message}", 8000)
+        # 传输结束，清除跟踪信息
+        self._last_transfer_dest = ""
+        self._last_transfer_direction = ""
+
+    def _refresh_after_transfer(self):
+        """传输完成后局部刷新受影响的目录，不清除整棵树。
+
+        仅刷新传输目标目录（或当前路径栏目录作为回退），
+        避免原本展开的树状结构瞬间闭合。
+        """
+        dest = self._last_transfer_dest
+        direction = self._last_transfer_direction
+
+        if direction == "push" and dest:
+            # 推送 → 刷新远程目标目录
+            item = self._remote_fs.find_item_for_path(dest)
+            if item is not None and self._remote_fs.is_dir(item):
+                self._remote_fs.refresh_directory(dest, item)
+                self._log(f"已刷新远程目录: {dest}")
+            elif self._is_tree_root_path(dest):
+                # 目标路径是树的根
+                self._remote_fs.refresh_directory(
+                    dest, self._remote_fs.model.invisibleRootItem()
+                )
+                self._log(f"已刷新根目录: {dest}")
+            else:
+                # 目标目录不在当前树中，回退刷新当前路径栏目录
+                self._remote_refresh_current()
+        elif direction == "pull" and dest:
+            # 拉取 → 刷新本地当前目录
+            self._local_refresh()
+        else:
+            # 回退：刷新远程当前目录
+            if self._tunnel_connected:
+                self._remote_refresh_current()
 
     def _set_transfer_ui(self, active: bool):
         self.sync_btn.setEnabled(not active)
@@ -652,11 +737,13 @@ class MainWindow(QMainWindow):
     # ─── 字体缩放 ─────────────────────────────────────────────
 
     def _setup_shortcuts(self):
-        """注册 Ctrl+= 放大, Ctrl+- 缩小"""
+        """注册 Ctrl+= 放大, Ctrl+- 缩小, F5 刷新远程当前目录"""
         zoom_in = QShortcut("Ctrl+=", self)
         zoom_in.activated.connect(self._zoom_in)
         zoom_out = QShortcut("Ctrl+-", self)
         zoom_out.activated.connect(self._zoom_out)
+        f5 = QShortcut("F5", self)
+        f5.activated.connect(self._remote_refresh_current)
 
     def _zoom_in(self):
         self._zoom(+2)
@@ -710,8 +797,26 @@ class MainWindow(QMainWindow):
 # 入口
 # ===================================================================
 
+def _check_sshpass():
+    """检查 sshpass 是否已安装，缺失则弹出提示并退出"""
+    if shutil.which("sshpass"):
+        return
+    QMessageBox.critical(
+        None, "缺少依赖",
+        "未找到 sshpass，SSH 连接功能无法使用。\n\n"
+        "请安装后重试：\n"
+        "  sudo apt install sshpass\n\n"
+        "安装完成后重新启动本程序。",
+    )
+    sys.exit(1)
+
+
 def main():
     app = QApplication(sys.argv)
+
+    # ── 环境自检：sshpass ──────────────────────────────────────
+    _check_sshpass()
+
     app.setStyle("Fusion")
 
     # 从配置加载字体大小

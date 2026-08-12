@@ -58,6 +58,17 @@ def file_type(name: str) -> str:
     return name.rsplit(".", 1)[1].lower() if "." in name else ""
 
 
+def format_size(size: int) -> str:
+    """本地/远程统一的大小格式（B/KB/MB/GB/TB，一位小数）"""
+    if size <= 0:
+        return ""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 def make_stylesheet(fs: int) -> str:
     """根据基准字体大小 fs 动态生成全应用样式表"""
     s, t = fs - 2, fs - 1          # 次级/工具栏字体

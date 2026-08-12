@@ -6,7 +6,7 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtWidgets import QAbstractItemView, QFileSystemModel, QTreeView
 
-from .config import file_type, format_mtime
+from .config import file_type, format_mtime, format_size
 
 
 class LocalFileProxyModel(QSortFilterProxyModel):
@@ -27,6 +27,12 @@ class LocalFileProxyModel(QSortFilterProxyModel):
         # 所有列左对齐
         if role == Qt.TextAlignmentRole:
             return Qt.AlignLeft | Qt.AlignVCenter
+        # 大小列与远程面板使用相同格式 (B/KB/MB/GB/TB)
+        if role == Qt.DisplayRole and index.column() == 1:
+            fi = self.sourceModel().fileInfo(self.mapToSource(index))
+            if fi.isDir():
+                return ""
+            return format_size(fi.size()) if fi.size() > 0 else "—"
         # 修改时间列与远程面板使用相同格式
         if role == Qt.DisplayRole and index.column() == 3:
             fi = self.sourceModel().fileInfo(self.mapToSource(index))
