@@ -410,16 +410,7 @@ class MainWindow(QMainWindow):
         if item is None or not self._remote_fs.is_dir(item):
             return
         path = self._remote_fs.get_full_path(item)
-
-        if self.remote_tree.isExpanded(index):
-            # 已展开 → 折叠
-            self.remote_tree.collapse(index)
-        else:
-            # 未展开 → 加载并展开
-            self.remote_path_bar.setText(path)
-            if not self._remote_fs.has_children_cached(path):
-                self._remote_fs.expand_directory(path, item)
-            self.remote_tree.expand(index)
+        self._load_remote_path(path)
 
     def _on_remote_expanded(self, index: QModelIndex):
         item = self._remote_fs.model.itemFromIndex(index)
@@ -454,9 +445,17 @@ class MainWindow(QMainWindow):
     # ─── 传输请求 ─────────────────────────────────────────────
 
     def _on_drop_transfer(self, sources: list, dest: str, direction: str):
-        """从拖放触发的传输请求"""
-        if sources:
-            self._show_transfer_dialog(sources, dest, direction)
+        """从拖放触发的传输请求: 目标未指定时回退到对端当前目录"""
+        if not sources:
+            return
+        if not dest:
+            # 拖到空白区域 → 使用对端面板当前目录
+            dest = (self.remote_path_bar.text().strip() if direction == "push"
+                    else self.local_path_bar.text().strip())
+            if not dest:
+                QMessageBox.warning(self, "提示", "无法确定目标目录")
+                return
+        self._show_transfer_dialog(sources, dest, direction)
 
     def _request_transfer(self, direction: str):
         """用户请求传输（从按钮触发）"""

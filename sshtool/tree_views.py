@@ -1,5 +1,7 @@
 """支持拖放的树视图组件"""
 
+import os
+
 from PyQt5.QtCore import (
     QAbstractProxyModel, QMimeData, QModelIndex, QSortFilterProxyModel, Qt,
     pyqtSignal,
@@ -88,55 +90,93 @@ class DragDropTreeView(QTreeView):
         item = src_model.itemFromIndex(src_idx)
         return item.data(Qt.UserRole) if item else ""
 
+    def _is_dir_item(self, idx: QModelIndex) -> bool:
+        """判断索引对应的是否为目录"""
+        model = self.model()
+        if isinstance(model, QAbstractProxyModel):
+            src_model = model.sourceModel()
+            src_idx = model.mapToSource(idx)
+        else:
+            src_model, src_idx = model, idx
+        if isinstance(src_model, QFileSystemModel):
+            return src_model.isDir(src_idx)
+        item = src_model.itemFromIndex(src_idx)
+        return bool(item and item.data(Qt.UserRole + 1))
+
     def dragEnterEvent(self, event):
         if event.source() is self:
             event.ignore()
             return
-        if event.mimeData().hasFormat("application/x-sshtool-paths"):
+        if event.mimeData().hasFormat("application/x-sshtool-paths") \
+                or event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasFormat("application/x-sshtool-paths"):
+        if event.mimeData().hasFormat("application/x-sshtool-paths") \
+                or event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event):
-        if not event.mimeData().hasFormat("application/x-sshtool-paths"):
-            event.ignore()
+        md = event.mimeData()
+
+        # ── 面板间拖放 (自定义 MIME) ──
+        if md.hasFormat("application/x-sshtool-paths"):
+            data = bytes(md.data("application/x-sshtool-paths")).decode()
+            source_role = data.split("|", 1)[0]
+            paths_str = data.split("|", 1)[1] if "|" in data else ""
+            source_paths = [p for p in paths_str.split("\n") if p]
+
+            if not source_paths:
+                event.ignore()
+                return
+
+            # 目标路径可能为空(落在空白区域) → 由主窗口回退到面板当前目录
+            target_path = self._get_target_path(event.pos())
+
+            # 判断方向: 从其他面板拖过来
+            if source_role != self._role:
+                direction = "push" if source_role == "local" else "pull"
+                event.acceptProposedAction()
+                self.drop_requested.emit(source_paths, target_path, direction)
+            else:
+                event.ignore()
             return
 
-        data = bytes(event.mimeData().data("application/x-sshtool-paths")).decode()
-        source_role = data.split("|", 1)[0]
-        paths_str = data.split("|", 1)[1] if "|" in data else ""
-        source_paths = [p for p in paths_str.split("\n") if p]
-
-        if not source_paths:
-            event.ignore()
-            return
-
-        # 获取目标路径
-        target_path = self._get_target_path()
-        if not target_path:
-            event.ignore()
-            return
-
-        # 判断方向: 从其他面板拖过来
-        if source_role != self._role:
-            direction = "push" if source_role == "local" else "pull"
+        # ── 外部应用拖入 (text/uri-list, 如文件管理器) ──
+        if md.hasUrls():
+            source_paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+            source_paths = [p for p in source_paths if p]
+            if not source_paths:
+                event.ignore()
+                return
+            # 外部拖入的都是本地文件: 仅远程面板接受(推送到远程);
+            # 拖到本地面板属于本地复制, 不支持
+            if self._role != "remote":
+                event.ignore()
+                return
+            # 目标路径可能为空(落在空白区域) → 由主窗口回退到面板当前目录
+            target_path = self._get_target_path(event.pos())
             event.acceptProposedAction()
-            self.drop_requested.emit(source_paths, target_path, direction)
-        else:
-            event.ignore()
+            self.drop_requested.emit(source_paths, target_path, "push")
+            return
 
-    def _get_target_path(self) -> str:
-        """获取当前面板的目标路径"""
-        idx = self.indexAt(self.viewport().rect().center())
-        if idx.isValid():
-            return self._path_for_index(idx)
-        return ""
+        event.ignore()
+
+    def _get_target_path(self, pos) -> str:
+        """获取当前面板的目标路径（落在文件上时取其父目录）"""
+        idx = self.indexAt(pos)
+        if not idx.isValid():
+            return ""
+        path = self._path_for_index(idx)
+        if not path:
+            return ""
+        if not self._is_dir_item(idx):
+            path = os.path.dirname(path)
+        return path
 
     def mimeData(self, indexes):
         """编码选中的路径为自定义 MIME 数据"""
@@ -153,4 +193,4 @@ class DragDropTreeView(QTreeView):
         return super().mimeData(indexes)
 
     def mimeTypes(self):
-        return ["application/x-sshtool-paths", "text/plain"]
+        return ["application/x-sshtool-paths", "text/uri-list", "text/plain"]
