@@ -10,6 +10,52 @@ from .rsync_options import RsyncOptions
 from .ssh_utils import check_tunnel, direction_text
 
 
+def parse_rsync_itemize(lines: list) -> dict:
+    """解析 rsync --itemize-changes 输出，按类别分组。
+
+    返回:
+        {
+            "new": [path, ...],        # 将新增的文件/目录
+            "update": [path, ...],     # 将覆盖/更新的文件
+            "delete": [path, ...],     # 将删除的文件 (--delete)
+        }
+
+    rsync -i 输出格式: YXcstpoguax path
+      Y: >从本地发出, <从远程接收, c本地变更, *消息
+      X: f文件, d目录, L符号链接
+      cstpoguax: 属性位 (+新增, .未变, 字母=对应属性变化)
+    """
+    result = {"new": [], "update": [], "delete": []}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # 删除行: *deleting   path
+        if line.startswith("*deleting"):
+            parts = line.split(None, 1)
+            if len(parts) > 1:
+                result["delete"].append(parts[1].strip())
+            continue
+        # itemize 行: 至少 12 字符 (11 字符 itemize + 空格 + 文件名)
+        if len(line) < 12:
+            continue
+        itemize = line[:11]
+        path = line[12:].strip()
+        if not path:
+            continue
+        # 校验 itemize 格式: YXcstpoguax
+        if itemize[0] not in "><ch.*" or itemize[1] not in "fdLD":
+            continue
+        attrs = itemize[2:11]  # cstpoguax
+        if all(c == "+" for c in attrs):
+            result["new"].append(path)
+        elif all(c == "." for c in attrs):
+            continue  # 未变化，不显示
+        else:
+            result["update"].append(path)
+    return result
+
+
 class TransferEngine(QThread):
     """后台传输引擎 — 只负责验证隧道存活 + rsync，不管理隧道生命周期"""
 
@@ -18,6 +64,7 @@ class TransferEngine(QThread):
     transfer_progress = pyqtSignal(str, int)  # (行文本, 百分比)
     transfer_done = pyqtSignal(bool, str)     # (成功, 消息)
     tunnel_lost = pyqtSignal()                # 隧道断开，通知 MainWindow 重连
+    preview_result = pyqtSignal(dict)         # dry-run 预览结果: {"new":[],"update":[],"delete":[]}
 
     def __init__(self, config: dict, rsync_opts: RsyncOptions,
                  sources: list, dest: str, direction: str,
@@ -32,6 +79,7 @@ class TransferEngine(QThread):
         self.dry_run = dry_run
         self._cancelled = False
         self._rsync_proc = None
+        self._itemized_lines: list = []  # dry-run 模式下收集 itemize 行
 
     def cancel(self):
         self._cancelled = True
@@ -53,6 +101,7 @@ class TransferEngine(QThread):
             self._emit_log("──────────────────────────────────────")
 
             if self._cancelled:
+                self.transfer_done.emit(False, "用户取消传输")
                 return
 
             # Step 1: 验证隧道是否存活（隧道由 MainWindow 维护）
@@ -66,6 +115,7 @@ class TransferEngine(QThread):
             self._emit_log("  ✓ 隧道可用")
 
             if self._cancelled:
+                self.transfer_done.emit(False, "用户取消传输")
                 return
 
             # Step 2: rsync 传输
@@ -105,6 +155,7 @@ class TransferEngine(QThread):
         rsync_args = ["rsync", "--outbuf=L"] + self.rsync_opts.to_args()
         if self.dry_run:
             rsync_args.append("--dry-run")
+            rsync_args.append("-i")  # --itemize-changes: 输出逐文件变更详情
         rsync_args.extend(["-e", ssh_cmd])
 
         if self.direction == "push":
@@ -130,6 +181,7 @@ class TransferEngine(QThread):
             )
 
             # 按 \r 或 \n 实时拆分输出(rsync 非 tty 模式下进度以 \r 刷新)
+            self._itemized_lines = []
             for line in self._iter_output_lines(self._rsync_proc.stdout.buffer):
                 if self._cancelled:
                     self._rsync_proc.terminate()
@@ -139,6 +191,11 @@ class TransferEngine(QThread):
                 self._process_output(line)
 
             self._rsync_proc.wait()
+
+            # dry-run 完成 → 解析 itemize 行并发射预览数据
+            if self.dry_run and self._itemized_lines:
+                preview = parse_rsync_itemize(self._itemized_lines)
+                self.preview_result.emit(preview)
 
             if self._rsync_proc.returncode == 0:
                 self.transfer_progress.emit("完成", 100)
@@ -196,6 +253,21 @@ class TransferEngine(QThread):
         # 进度刷新行形如 " 5,308,416  25%    4.88MB/s    0:00:03", 仅用于进度显示
         if "%" not in line or ("/s" not in line and "xfr#" not in line):
             self._emit_log(f"  {line}")
+        # dry-run 模式: 收集 itemize 行用于预览对话框
+        if self.dry_run and self._is_itemize_line(line):
+            self._itemized_lines.append(line)
+
+    @staticmethod
+    def _is_itemize_line(line: str) -> bool:
+        """判断是否为 rsync -i 输出的变更行（YXcstpoguax 格式或 *deleting）"""
+        if line.startswith("*deleting"):
+            return True
+        if len(line) < 12:
+            return False
+        # YXcstpoguax: Y 是 >, <, c, h, ., *; X 是 f, d, L, D, S
+        if line[0] in "><ch.*" and line[1] in "fdLD":
+            return True
+        return False
 
     def _emit_log(self, msg: str):
         self.log_message.emit(msg)

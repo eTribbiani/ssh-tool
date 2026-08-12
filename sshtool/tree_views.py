@@ -6,7 +6,11 @@ from PyQt5.QtCore import (
     QAbstractProxyModel, QMimeData, QModelIndex, QSortFilterProxyModel, Qt,
     pyqtSignal,
 )
-from PyQt5.QtWidgets import QAbstractItemView, QFileSystemModel, QTreeView
+from PyQt5.QtGui import QColor, QPainter
+from PyQt5.QtWidgets import (
+    QAbstractItemView, QFileSystemModel, QStyledItemDelegate, QStyleOptionViewItem,
+    QTreeView,
+)
 
 from .config import file_type, format_mtime, format_size
 
@@ -59,6 +63,48 @@ class LocalFileProxyModel(QSortFilterProxyModel):
         return l_name < r_name
 
 
+class RemoteFileFilterProxy(QSortFilterProxyModel):
+    """远程文件模型过滤代理: 支持递归文件名过滤。
+
+    包装 RemoteFileSystemModel 的 QStandardItemModel，
+    按名称列(第0列)过滤，同时保持匹配文件的父目录可见。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDynamicSortFilter(True)
+        self.setRecursiveFilteringEnabled(True)
+        self.setFilterKeyColumn(0)
+        self.setFilterCaseSensitivity(Qt.CaseInsensitive)
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        """递归过滤: 目录下任一后代匹配则保留该目录。"""
+        model = self.sourceModel()
+        if model is None:
+            return True
+
+        idx = model.index(source_row, 0, source_parent)
+        name = model.data(idx, Qt.DisplayRole)
+        if name is None:
+            return True
+
+        # 始终显示"加载中..."占位符，避免目录被误隐藏
+        if name == "加载中...":
+            return True
+
+        # 文件名匹配 → 接受
+        if self.filterRegExp().isEmpty():
+            return True
+        if name and self.filterRegExp().indexIn(name) >= 0:
+            return True
+
+        # 检查子节点是否有匹配项（配合 RecursiveFilteringEnabled）
+        if model.hasChildren(idx):
+            return super().filterAcceptsRow(source_row, source_parent)
+
+        return False
+
+
 class DragDropTreeView(QTreeView):
     """自定义 TreeView，支持文件拖放传输"""
 
@@ -73,6 +119,7 @@ class DragDropTreeView(QTreeView):
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
         self._role = "local"  # "local" 或 "remote"
+        self._drop_target = QModelIndex()  # 拖放悬停的目标目录(用于高亮)
 
     def set_role(self, role: str):
         self._role = role
@@ -103,24 +150,65 @@ class DragDropTreeView(QTreeView):
         item = src_model.itemFromIndex(src_idx)
         return bool(item and item.data(Qt.UserRole + 1))
 
+    def _drop_target_index(self, pos) -> QModelIndex:
+        """拖放目标: 目录本身高亮; 落在文件上时高亮其父目录(需为可见子目录)"""
+        idx = self.indexAt(pos)
+        if not idx.isValid():
+            return QModelIndex()
+        if self._is_dir_item(idx):
+            return idx
+        parent = idx.parent()
+        if parent.isValid() and parent != self.rootIndex():
+            return parent
+        return QModelIndex()
+
+    def _set_drop_target(self, idx: QModelIndex):
+        """更新拖放目标并触发重绘"""
+        if idx != self._drop_target:
+            self._drop_target = idx
+            self.viewport().update()
+
     def dragEnterEvent(self, event):
         if event.source() is self:
+            self._set_drop_target(QModelIndex())
             event.ignore()
             return
         if event.mimeData().hasFormat("application/x-sshtool-paths") \
                 or event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
+            self._set_drop_target(QModelIndex())
             event.ignore()
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasFormat("application/x-sshtool-paths") \
                 or event.mimeData().hasUrls():
             event.acceptProposedAction()
+            self._set_drop_target(self._drop_target_index(event.pos()))
         else:
+            self._set_drop_target(QModelIndex())
             event.ignore()
 
+    def dragLeaveEvent(self, event):
+        self._set_drop_target(QModelIndex())
+        super().dragLeaveEvent(event)
+
+    def paintEvent(self, event):
+        """绘制拖放目标高亮框"""
+        super().paintEvent(event)
+        if not self._drop_target.isValid():
+            return
+        rect = self.visualRect(self._drop_target)
+        if not rect.isValid():
+            return
+        painter = QPainter(self.viewport())
+        painter.fillRect(rect, QColor(38, 79, 120, 110))
+        painter.setPen(QColor(14, 99, 156))
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.end()
+
     def dropEvent(self, event):
+        self._set_drop_target(QModelIndex())
         md = event.mimeData()
 
         # ── 面板间拖放 (自定义 MIME) ──
@@ -194,3 +282,67 @@ class DragDropTreeView(QTreeView):
 
     def mimeTypes(self):
         return ["application/x-sshtool-paths", "text/uri-list", "text/plain"]
+
+
+# ─── Diff Status ───────────────────────────────────────────────
+
+
+class DiffStatus:
+    """文件差异状态"""
+    SAME = 0
+    ONLY_LOCAL = 1
+    ONLY_REMOTE = 2
+    LOCAL_NEWER = 3
+    REMOTE_NEWER = 4
+    SIZE_DIFFERS = 5
+
+
+# 差异状态对应的背景色 (RGBA, 暗色主题下带透明度的柔和底色)
+_DIFF_COLORS = {
+    DiffStatus.ONLY_LOCAL:   QColor(80, 180, 80, 55),   # 绿色 — 仅本地存在
+    DiffStatus.ONLY_REMOTE:  QColor(200, 90, 90, 55),   # 红色 — 仅远程存在
+    DiffStatus.LOCAL_NEWER:  QColor(90, 150, 220, 55),  # 蓝色 — 本地较新
+    DiffStatus.REMOTE_NEWER: QColor(220, 160, 70, 55),  # 橙色 — 远程较新
+    DiffStatus.SIZE_DIFFERS: QColor(210, 190, 60, 55),  # 黄色 — 大小不同
+}
+
+
+class DiffHighlightDelegate(QStyledItemDelegate):
+    """根据本地/远程差异状态为树视图行着色。
+
+    在列 0（文件名列）上绘制差异背景色，使差异一目了然。
+    左右面板各自设置一个 delegate 实例，由 MainWindow 在目录切换后
+    调用 set_diff_data() 更新差异数据。
+    """
+
+    def __init__(self, side: str = "local", parent=None):
+        """
+        side: "local" 或 "remote" — 用于区分该 delegate 所属面板
+              远程面板不显示 ONLY_LOCAL 状态，本地面板不显示 ONLY_REMOTE
+        """
+        super().__init__(parent)
+        self._side = side
+        self._diff: dict = {}  # filename -> DiffStatus
+
+    def set_diff_data(self, diff: dict):
+        """更新差异数据并触发重绘。diff: {filename: DiffStatus}"""
+        self._diff = diff
+
+    def paint(self, painter, option, index):
+        """在列 0 上绘制差异背景色"""
+        if index.column() == 0 and self._diff:
+            filename = index.data(Qt.DisplayRole)
+            status = self._diff.get(filename)
+            if status is not None and status != DiffStatus.SAME:
+                # 远程面板不显示 ONLY_LOCAL，本地面板不显示 ONLY_REMOTE
+                if self._side == "remote" and status == DiffStatus.ONLY_LOCAL:
+                    pass
+                elif self._side == "local" and status == DiffStatus.ONLY_REMOTE:
+                    pass
+                else:
+                    bg = _DIFF_COLORS.get(status)
+                    if bg:
+                        painter.save()
+                        painter.fillRect(option.rect, bg)
+                        painter.restore()
+        super().paint(painter, option, index)

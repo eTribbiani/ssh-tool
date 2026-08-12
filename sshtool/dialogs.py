@@ -1,14 +1,27 @@
-"""对话框: RsyncOptionsDialog(传输前选项) + ConfigDialog(连接配置)"""
+"""对话框: RsyncOptionsDialog(传输前选项) + ConfigDialog(连接配置) + TransferPreviewDialog"""
 
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QTabWidget,
-    QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .config import ConfigManager, EXCLUDE_PATTERNS
+from .icons import get_icon
 from .rsync_options import RsyncOptions
 from .ssh_utils import direction_text, test_tunnel_flow
+
+# 一键排除套餐: 选择后自动勾选对应工程类型的排除项(未列出的清除)
+EXCLUDE_PACKAGES = {
+    "C/C++ 工程": ["exclude_o", "exclude_a", "exclude_build", "exclude_install"],
+    "Python 工程": ["exclude_pycache", "exclude_pyc"],
+    "ROS 工程": ["exclude_build", "exclude_install", "exclude_pycache",
+                 "exclude_pyc", "exclude_o"],
+    "嵌入式固件": ["exclude_o", "exclude_a", "exclude_deb",
+                  "exclude_zip", "exclude_targz"],
+}
 
 
 class RsyncOptionsDialog(QDialog):
@@ -46,18 +59,18 @@ class RsyncOptionsDialog(QDialog):
 
         src_label = QLabel("\n".join(self._sources))
         src_label.setWordWrap(True)
-        src_label.setStyleSheet("color: #6cb6ff;")
+        src_label.setStyleSheet("color: #7aa2f7;")
         s_layout.addRow("源:", src_label)
 
         dest_label = QLabel(self._dest)
         dest_label.setWordWrap(True)
-        dest_label.setStyleSheet("color: #6cb6ff;")
+        dest_label.setStyleSheet("color: #7aa2f7;")
         s_layout.addRow("目标:", dest_label)
 
         # 覆盖策略: 随选项实时更新
         self.strategy_label = QLabel()
         self.strategy_label.setWordWrap(True)
-        self.strategy_label.setStyleSheet("color: #6cb6ff;")
+        self.strategy_label.setStyleSheet("color: #7aa2f7;")
         s_layout.addRow("覆盖策略:", self.strategy_label)
 
         layout.addWidget(summary_group)
@@ -74,6 +87,16 @@ class RsyncOptionsDialog(QDialog):
         preset_row.addWidget(self.preset_combo, 1)
         preset_row.addStretch()
         opts_layout.addLayout(preset_row)
+
+        # 排除套餐: 一键勾选对应工程类型的排除项
+        package_row = QHBoxLayout()
+        package_row.addWidget(QLabel("排除套餐:"))
+        self.package_combo = QComboBox()
+        self.package_combo.addItems(["无（手动选择）"] + list(EXCLUDE_PACKAGES.keys()))
+        self.package_combo.currentTextChanged.connect(self._on_package_changed)
+        package_row.addWidget(self.package_combo, 1)
+        package_row.addStretch()
+        opts_layout.addLayout(package_row)
 
         basic_group = QGroupBox("基本选项")
         basic_layout = QHBoxLayout(basic_group)
@@ -125,7 +148,9 @@ class RsyncOptionsDialog(QDialog):
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
         buttons.button(QDialogButtonBox.Ok).setText("确认传输")
+        buttons.button(QDialogButtonBox.Ok).setIcon(QIcon())
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.button(QDialogButtonBox.Cancel).setIcon(QIcon())
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -143,6 +168,22 @@ class RsyncOptionsDialog(QDialog):
         factory = self.PRESETS.get(text)
         if factory:
             self._apply_options(factory())
+
+    def _on_package_changed(self, text: str):
+        """应用排除套餐: 勾选套餐内排除项, 清除其他排除项"""
+        if self._building:
+            return
+        attrs = EXCLUDE_PACKAGES.get(text)
+        if attrs is None:
+            return
+        self._building = True
+        for attr, cb in self._exclude_checks.items():
+            cb.setChecked(attr in attrs)
+        self._building = False
+        # 刷新预设与覆盖策略显示
+        opts = self._collect_options()
+        self._update_strategy(opts)
+        self.preset_combo.setCurrentText(self._match_preset(opts))
 
     def _update_strategy(self, opts: RsyncOptions):
         """更新覆盖策略说明文字"""
@@ -270,8 +311,11 @@ class ConfigDialog(QDialog):
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply
         )
         buttons.button(QDialogButtonBox.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.Ok).setIcon(QIcon())
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.button(QDialogButtonBox.Cancel).setIcon(QIcon())
         buttons.button(QDialogButtonBox.Apply).setText("应用")
+        buttons.button(QDialogButtonBox.Apply).setIcon(QIcon())
         buttons.accepted.connect(self._on_ok)
         buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.Apply).clicked.connect(self._on_apply)
@@ -326,3 +370,104 @@ class ConfigDialog(QDialog):
 
     def get_config(self) -> dict:
         return self.config
+
+
+class TransferPreviewDialog(QDialog):
+    """传输预览对话框 — 解析 rsync dry-run 输出，分门别类展示文件变更。
+
+    通过 TabWidget 展示三类文件：
+      将新增 / 将覆盖/更新 / 将删除（启用了 --delete 时）
+    """
+
+    CATEGORIES = [
+        ("new", "将新增", "#9ece6a"),
+        ("update", "将覆盖/更新", "#e0af68"),
+        ("delete", "将删除", "#f7768e"),
+    ]
+
+    def __init__(self, preview_data: dict, direction: str, parent=None):
+        """
+        preview_data: {"new": [path,...], "update": [path,...], "delete": [path,...]}
+        direction: "push" 或 "pull"
+        """
+        super().__init__(parent)
+        self._data = preview_data
+        self._direction = direction
+        self.setWindowTitle("传输预览")
+        self.setMinimumSize(700, 560)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ── 摘要 ──
+        summary = QGroupBox("预览摘要")
+        s_layout = QVBoxLayout(summary)
+
+        arrow = "本地 → 远程" if self._direction == "push" else "远程 → 本地"
+        s_layout.addWidget(QLabel(f"方向: {arrow}"))
+
+        total = sum(len(self._data.get(k, [])) for k in ["new", "update", "delete"])
+        counts_parts = []
+        for key, label, _ in self.CATEGORIES:
+            n = len(self._data.get(key, []))
+            if n > 0:
+                counts_parts.append(f"{label}: {n} 项")
+        counts_text = "  |  ".join(counts_parts) if counts_parts else "无变更"
+        count_label = QLabel(f"变更统计: {counts_text} (共 {total} 项)")
+        count_label.setWordWrap(True)
+        s_layout.addWidget(count_label)
+
+        layout.addWidget(summary)
+
+        # ── 分类标签页 ──
+        self._tabs = QTabWidget()
+        self._list_widgets: dict = {}
+
+        for key, label, color in self.CATEGORIES:
+            files = self._data.get(key, [])
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
+            tab_layout.setContentsMargins(4, 4, 4, 4)
+
+            header = QLabel(f"{label}: {len(files)} 项")
+            header.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 15pt;")
+            tab_layout.addWidget(header)
+
+            list_widget = QListWidget()
+            list_widget.setStyleSheet(
+                "QListWidget { background-color: #1e2030; color: #c0caf5; "
+                "border: 1px solid #3b4261; }"
+                "QListWidget::item { padding: 2px 6px; }"
+            )
+            if not files:
+                list_widget.addItem("（无）")
+            else:
+                for path in sorted(files):
+                    item = QListWidgetItem(path)
+                    item.setForeground(Qt.gray)  # placeholder color, overridden below
+                    list_widget.addItem(item)
+            tab_layout.addWidget(list_widget)
+            self._list_widgets[key] = list_widget
+            self._tabs.addTab(
+                tab,
+                get_icon("circle-fill", color=color, size=10),
+                f"{label} ({len(files)})",
+            )
+
+        # 默认选中第一个有内容的标签页
+        for key, _, _ in self.CATEGORIES:
+            if self._data.get(key):
+                self._tabs.setCurrentWidget(
+                    self._list_widgets[key].parent()
+                )
+                break
+
+        layout.addWidget(self._tabs, 1)
+
+        # ── 按钮 ──
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.button(QDialogButtonBox.Ok).setText("关闭")
+        buttons.button(QDialogButtonBox.Ok).setIcon(QIcon())
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)

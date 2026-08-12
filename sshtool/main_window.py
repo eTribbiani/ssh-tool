@@ -1,27 +1,71 @@
 """MainWindow — 主窗口与程序入口"""
 
+import json
 import os
 import shutil
 import sys
-import time
-from typing import Optional
 
-from PyQt5.QtCore import QDir, QModelIndex, QSettings, Qt
+from PyQt5.QtCore import QDir, QModelIndex, QSettings, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QCheckBox, QDialog, QFileSystemModel, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QShortcut, QSplitter, QStatusBar, QTextEdit, QToolBar,
+    QAction, QApplication, QCheckBox, QComboBox, QDialog, QFileSystemModel,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QShortcut, QSplitter, QStatusBar, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
 from .config import APP_NAME, ConfigManager, clamp_font, make_stylesheet
-from .dialogs import ConfigDialog, RsyncOptionsDialog
+from .dialogs import ConfigDialog, RsyncOptionsDialog, TransferPreviewDialog
+from .icons import get_icon
 from .remote_fs import RemoteFileSystemModel
 from .rsync_options import RsyncOptions
-from .ssh_utils import check_tunnel, open_tunnel, test_tunnel_flow
+from .ssh_utils import TunnelConnector, test_tunnel_flow
+from .tasks import CANCELLED, DONE, FAILED, TransferQueue
 from .transfer_engine import TransferEngine
-from .tree_views import DragDropTreeView, LocalFileProxyModel
+from .tree_views import DragDropTreeView, DiffHighlightDelegate, DiffStatus, LocalFileProxyModel, RemoteFileFilterProxy
+
+
+class TaskRowWidget(QWidget):
+    """任务列表行: 标题/状态/进度/取消按钮"""
+
+    cancel_requested = pyqtSignal(int)
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(2)
+
+        top = QHBoxLayout()
+        self.title_label = QLabel(task.title)
+        self.title_label.setStyleSheet("font-weight: bold;")
+        top.addWidget(self.title_label, 1)
+        self.status_label = QLabel("排队中")
+        top.addWidget(self.status_label)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setFixedWidth(56)
+        self.cancel_btn.clicked.connect(
+            lambda: self.cancel_requested.emit(task.id))
+        top.addWidget(self.cancel_btn)
+        lay.addLayout(top)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        lay.addWidget(self.progress)
+
+    def set_status(self, text: str, color: str = None):
+        self.status_label.setText(text)
+        if color:
+            self.status_label.setStyleSheet(f"color: {color};")
+
+    def set_progress(self, pct: int):
+        if pct >= 0:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(pct)
+        elif self.progress.value() == 0:
+            self.progress.setRange(0, 0)  # 不确定模式
 
 
 class MainWindow(QMainWindow):
@@ -37,12 +81,25 @@ class MainWindow(QMainWindow):
         self._config = self._config_mgr.load()
         self._default_rsync_opts = RsyncOptions.preset_full()
         self._tunnel_connected = False
-        self._transfer_engine: Optional[TransferEngine] = None
         self._local_paths = set()    # 本地选中缓存
         self._remote_paths = set()   # 远程选中缓存
-        self._last_transfer_dest: str = ""
-        self._last_transfer_direction: str = ""
         self._tree_root_path: str = ""
+        self._local_bookmarks: list[str] = []
+        self._remote_bookmarks: list[str] = []
+
+        # 后台传输队列
+        self._task_rows: dict = {}
+        self._queue = TransferQueue(
+            config_provider=lambda: self._config,
+            tunnel_provider=self._tunnel_state,
+            tunnel_connect=lambda: self._connect_tunnel(silent=True),
+            parent=self,
+        )
+
+        # 隧道连接状态(异步, 不阻塞界面)
+        self._connecting = False
+        self._connect_aborted = False
+        self._connector = None
 
         # 字体大小
         self._font_size = clamp_font(self._config.get("font_size", 25))
@@ -50,8 +107,13 @@ class MainWindow(QMainWindow):
         # 远程文件模型
         self._remote_fs = RemoteFileSystemModel(self._config)
 
+        # 远程文件过滤代理（包装 QStandardItemModel，支持搜索过滤）
+        self._remote_proxy = RemoteFileFilterProxy()
+        self._remote_proxy.setSourceModel(self._remote_fs.model)
+
         self._build_ui()
         self._connect_signals()
+        self._connect_queue()
         self._setup_shortcuts()
 
         # 恢复窗口几何
@@ -59,6 +121,9 @@ class MainWindow(QMainWindow):
         geo = settings.value("geometry")
         if geo:
             self.restoreGeometry(geo)
+
+        # 加载书签
+        self._load_bookmarks()
 
     # ─── UI 构建 ───────────────────────────────────────────────
 
@@ -70,6 +135,10 @@ class MainWindow(QMainWindow):
         edit_config_action = QAction("编辑连接配置...", self)
         edit_config_action.triggered.connect(self._open_config_dialog)
         config_menu.addAction(edit_config_action)
+
+        delete_profile_action = QAction("删除当前环境...", self)
+        delete_profile_action.triggered.connect(self._delete_profile)
+        config_menu.addAction(delete_profile_action)
 
         tunnel_menu = menubar.addMenu("隧道")
         connect_action = QAction("连接隧道", self)
@@ -85,55 +154,94 @@ class MainWindow(QMainWindow):
         test_action.triggered.connect(self._test_connection)
         tunnel_menu.addAction(test_action)
 
-        # 工具栏
-        toolbar = QToolBar("传输")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+        self._bookmarks_menu = menubar.addMenu("书签")
+        # 菜单项在 _rebuild_bookmark_menu 中动态构建
 
-        self.connect_btn = QPushButton("🔌 连接隧道")
+        # ── 工具栏（QWidget + QHBoxLayout，底部对齐）──────────────
+        toolbar_widget = QWidget()
+        toolbar_widget.setObjectName("toolbar")
+        toolbar_layout = QHBoxLayout(toolbar_widget)
+        toolbar_layout.setContentsMargins(10, 4, 10, 6)
+        toolbar_layout.setSpacing(8)
+        toolbar_layout.setAlignment(Qt.AlignBottom)
+
+        # 环境选择: 多组连接配置, 切换自动重连隧道
+        env_label = QLabel("环境:")
+        env_label.setObjectName("toolbarLabel")
+        toolbar_layout.addWidget(env_label)
+
+        self._loading_profiles = False
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(140)
+        self.profile_combo.setObjectName("toolbarCombo")
+        self._loading_profiles = True
+        self.profile_combo.addItems(self._config_mgr.profiles())
+        self.profile_combo.setCurrentText(self._config_mgr.current_profile)
+        self._loading_profiles = False
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        toolbar_layout.addWidget(self.profile_combo)
+
+        self.add_profile_btn = QPushButton("")
+        self.add_profile_btn.setToolTip("新建环境")
+        self.add_profile_btn.setFixedSize(32, 32)
+        self.add_profile_btn.setObjectName("addProfileBtn")
+        self.add_profile_btn.setIcon(get_icon("plus", size=18, color="#a9b1d6"))
+        self.add_profile_btn.clicked.connect(self._add_profile)
+        toolbar_layout.addWidget(self.add_profile_btn)
+
+        toolbar_layout.addSpacing(12)
+
+        self.connect_btn = QPushButton(" 连接隧道")
         self.connect_btn.setToolTip("建立 SSH 隧道并加载远程目录")
-        self.connect_btn.setStyleSheet(
-            "QPushButton { background-color: #2a8c3c; }"
-            "QPushButton:hover { background-color: #35a54a; }"
-        )
-        toolbar.addWidget(self.connect_btn)
+        self.connect_btn.setObjectName("connectBtn")
+        self.connect_btn.setIcon(get_icon("plug", size=20, color="#9ece6a"))
+        toolbar_layout.addWidget(self.connect_btn)
 
-        self.disconnect_btn = QPushButton("🔌 断开")
+        self.disconnect_btn = QPushButton(" 断开")
         self.disconnect_btn.setToolTip("断开 SSH 隧道")
         self.disconnect_btn.setEnabled(False)
-        self.disconnect_btn.setStyleSheet(
-            "QPushButton { background-color: #8c3c2a; }"
-            "QPushButton:hover { background-color: #a54a35; }"
-        )
-        toolbar.addWidget(self.disconnect_btn)
+        self.disconnect_btn.setObjectName("disconnectBtn")
+        self.disconnect_btn.setIcon(get_icon("plug", size=20, color="#f7768e"))
+        toolbar_layout.addWidget(self.disconnect_btn)
 
-        toolbar.addSeparator()
+        toolbar_layout.addSpacing(12)
 
-        self.push_btn = QPushButton("← 推送 (本地→远程)")
+        self.push_btn = QPushButton(" 推送 (本地→远程)")
         self.push_btn.setToolTip("将选中文件推送到远程")
-        toolbar.addWidget(self.push_btn)
+        self.push_btn.setIcon(get_icon("arrow-left", size=20, color="#a9b1d6"))
+        toolbar_layout.addWidget(self.push_btn)
 
-        self.pull_btn = QPushButton("→ 拉取 (远程→本地)")
+        self.pull_btn = QPushButton(" 拉取 (远程→本地)")
         self.pull_btn.setToolTip("将选中文件拉取到本地")
-        toolbar.addWidget(self.pull_btn)
+        self.pull_btn.setIcon(get_icon("arrow-right", size=20, color="#a9b1d6"))
+        toolbar_layout.addWidget(self.pull_btn)
 
-        toolbar.addSeparator()
+        toolbar_layout.addSpacing(12)
 
         self.dry_run_cb = QCheckBox("仅预览 (dry-run)")
         self.dry_run_cb.setToolTip("预览模式，不实际传输文件")
-        toolbar.addWidget(self.dry_run_cb)
+        self.dry_run_cb.setObjectName("dryRunCb")
+        toolbar_layout.addWidget(self.dry_run_cb)
 
-        self.sync_btn = QPushButton("▶ 开始传输")
+        self.sync_btn = QPushButton(" 开始传输")
         self.sync_btn.setToolTip("开始文件传输")
-        toolbar.addWidget(self.sync_btn)
+        self.sync_btn.setIcon(get_icon("play", size=20, color="#a9b1d6"))
+        toolbar_layout.addWidget(self.sync_btn)
 
-        self.stop_btn = QPushButton("■ 停止")
+        self.preview_btn = QPushButton(" 预览传输")
+        self.preview_btn.setToolTip("预览传输变更（dry-run），显示文件差异详情")
+        self.preview_btn.setObjectName("previewBtn")
+        self.preview_btn.setIcon(get_icon("search", size=20, color="#bb9af7"))
+        toolbar_layout.addWidget(self.preview_btn)
+
+        self.stop_btn = QPushButton(" 停止当前任务")
         self.stop_btn.setEnabled(False)
-        self.stop_btn.setStyleSheet(
-            "QPushButton { background-color: #c44; }"
-            "QPushButton:hover { background-color: #e55; }"
-        )
-        toolbar.addWidget(self.stop_btn)
+        self.stop_btn.setToolTip("取消当前正在执行的任务")
+        self.stop_btn.setObjectName("stopBtn")
+        self.stop_btn.setIcon(get_icon("square", size=20, color="#f7768e"))
+        toolbar_layout.addWidget(self.stop_btn)
+
+        toolbar_layout.addStretch()
 
         # 中央区域 — 双栏分割器
         splitter = QSplitter(Qt.Horizontal)
@@ -153,12 +261,20 @@ class MainWindow(QMainWindow):
         # 本地导航按钮
         local_nav = QHBoxLayout()
         local_nav.setSpacing(2)
-        self.local_up_btn = self._make_nav_btn("⬆", "上一级", self._local_go_up)
-        self.local_home_btn = self._make_nav_btn("⌂", "主目录", self._local_go_home)
-        self.local_refresh_btn = self._make_nav_btn("↻", "刷新", self._local_refresh)
+        self.local_up_btn = self._make_nav_btn("chevron-up", "上一级", self._local_go_up)
+        self.local_home_btn = self._make_nav_btn("home", "主目录", self._local_go_home)
+        self.local_refresh_btn = self._make_nav_btn("refresh-cw", "刷新", self._local_refresh)
+        self.local_bookmark_btn = self._make_nav_btn("star", "收藏当前路径", self._toggle_local_bookmark)
+        self.local_bookmark_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.local_bookmark_btn.customContextMenuRequested.connect(
+            lambda pos: self._show_bookmark_menu(
+                self.local_bookmark_btn, pos, self._local_bookmarks, self._set_local_root
+            )
+        )
         local_nav.addWidget(self.local_up_btn)
         local_nav.addWidget(self.local_home_btn)
         local_nav.addWidget(self.local_refresh_btn)
+        local_nav.addWidget(self.local_bookmark_btn)
         local_nav.addStretch()
         left_layout.addLayout(local_nav)
 
@@ -186,6 +302,13 @@ class MainWindow(QMainWindow):
         self.local_tree.sortByColumn(0, Qt.AscendingOrder)
         left_layout.addWidget(self.local_tree)
 
+        # 本地搜索过滤框
+        self.local_search = QLineEdit()
+        self.local_search.setPlaceholderText("搜索/过滤文件名...")
+        self.local_search.setClearButtonEnabled(True)
+        self.local_search.setToolTip("输入文字即时过滤当前目录中的文件")
+        left_layout.addWidget(self.local_search)
+
         self.local_selection_label = QLabel("已选: 0 项")
         left_layout.addWidget(self.local_selection_label)
 
@@ -206,18 +329,26 @@ class MainWindow(QMainWindow):
         # 远程导航按钮
         remote_nav = QHBoxLayout()
         remote_nav.setSpacing(2)
-        self.remote_up_btn = self._make_nav_btn("⬆", "上一级", self._remote_go_up)
-        self.remote_root_btn = self._make_nav_btn("⌂", "根目录", self._remote_go_root)
-        self.remote_refresh_btn = self._make_nav_btn("↻", "刷新当前目录 (F5)", self._remote_refresh_current)
+        self.remote_up_btn = self._make_nav_btn("chevron-up", "上一级", self._remote_go_up)
+        self.remote_root_btn = self._make_nav_btn("home", "根目录", self._remote_go_root)
+        self.remote_refresh_btn = self._make_nav_btn("refresh-cw", "刷新当前目录 (F5)", self._remote_refresh_current)
+        self.remote_bookmark_btn = self._make_nav_btn("star", "收藏当前路径", self._toggle_remote_bookmark)
+        self.remote_bookmark_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.remote_bookmark_btn.customContextMenuRequested.connect(
+            lambda pos: self._show_bookmark_menu(
+                self.remote_bookmark_btn, pos, self._remote_bookmarks, self._load_remote_path
+            )
+        )
         remote_nav.addWidget(self.remote_up_btn)
         remote_nav.addWidget(self.remote_root_btn)
         remote_nav.addWidget(self.remote_refresh_btn)
+        remote_nav.addWidget(self.remote_bookmark_btn)
         remote_nav.addStretch()
         right_layout.addLayout(remote_nav)
 
         self.remote_tree = DragDropTreeView()
         self.remote_tree.set_role("remote")
-        self.remote_tree.setModel(self._remote_fs.model)
+        self.remote_tree.setModel(self._remote_proxy)
         self.remote_tree.setColumnWidth(0, 420)
         # 三列均匀分布 + 左对齐
         rheader = self.remote_tree.header()
@@ -228,6 +359,13 @@ class MainWindow(QMainWindow):
         rheader.setDefaultAlignment(Qt.AlignLeft)
         right_layout.addWidget(self.remote_tree)
 
+        # 远程搜索过滤框
+        self.remote_search = QLineEdit()
+        self.remote_search.setPlaceholderText("搜索/过滤文件名...")
+        self.remote_search.setClearButtonEnabled(True)
+        self.remote_search.setToolTip("输入文字即时过滤远程目录中的文件")
+        right_layout.addWidget(self.remote_search)
+
         self.remote_selection_label = QLabel("已选: 0 项")
         right_layout.addWidget(self.remote_selection_label)
 
@@ -235,35 +373,42 @@ class MainWindow(QMainWindow):
 
         splitter.setSizes([550, 550])
 
-        # 底部面板 — 进度 + 日志
-        bottom_panel = QWidget()
-        bottom_layout = QVBoxLayout(bottom_panel)
-        bottom_layout.setContentsMargins(4, 2, 4, 4)
+        # 底部面板 — 任务列表 + 日志
+        self._bottom_tabs = QTabWidget()
+        self._bottom_tabs.setDocumentMode(True)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        bottom_layout.addWidget(self.progress_bar)
+        self.task_list = QListWidget()
+        self.task_list.setMaximumHeight(200)
+        self._bottom_tabs.addTab(self.task_list, "任务")
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumHeight(150)
         self.log_view.setFont(QFont("DejaVu Sans Mono", 13))
-        bottom_layout.addWidget(self.log_view)
+        self._bottom_tabs.addTab(self.log_view, "日志")
 
-        # 放入主分割器下方
+        # 主布局：工具栏 → 分割器 → 底部面板
         main_widget = QWidget()
         main_layout = QVBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        main_layout.addWidget(toolbar_widget, 0)
         main_layout.addWidget(splitter, 1)
-        main_layout.addWidget(bottom_panel, 0)
+        main_layout.addWidget(self._bottom_tabs, 0)
         self.setCentralWidget(main_widget)
 
         # 状态栏
         self.status_bar = QStatusBar()
         self.tunnel_status_label = QLabel("● 未连接")
-        self.tunnel_status_label.setStyleSheet("color: #ff8888;")
+        self.tunnel_status_label.setStyleSheet("color: #f7768e;")
         self.status_bar.addPermanentWidget(self.tunnel_status_label)
         self.setStatusBar(self.status_bar)
+
+        # 差异高亮代理: 本地/远程各一个实例
+        self._local_diff = DiffHighlightDelegate("local", self)
+        self._remote_diff = DiffHighlightDelegate("remote", self)
+        self.local_tree.setItemDelegate(self._local_diff)
+        self.remote_tree.setItemDelegate(self._remote_diff)
 
     # ─── 信号连接 ─────────────────────────────────────────────
 
@@ -274,6 +419,7 @@ class MainWindow(QMainWindow):
         self.push_btn.clicked.connect(lambda: self._request_transfer("push"))
         self.pull_btn.clicked.connect(lambda: self._request_transfer("pull"))
         self.sync_btn.clicked.connect(lambda: self._request_transfer("push"))
+        self.preview_btn.clicked.connect(self._request_preview)
         self.stop_btn.clicked.connect(self._stop_transfer)
 
         # 路径栏回车导航
@@ -299,17 +445,22 @@ class MainWindow(QMainWindow):
         # 远程树的展开信号
         self.remote_tree.expanded.connect(self._on_remote_expanded)
 
+        # 搜索过滤
+        self.local_search.textChanged.connect(self._on_local_search)
+        self.remote_search.textChanged.connect(self._on_remote_search)
+
     # ─── 导航 ─────────────────────────────────────────────────
 
-    def _make_nav_btn(self, text: str, tooltip: str, slot) -> QPushButton:
-        """创建紧凑导航按钮"""
-        btn = QPushButton(text)
+    def _make_nav_btn(self, icon_name: str, tooltip: str, slot) -> QPushButton:
+        """创建紧凑导航按钮（Lucide 图标）"""
+        btn = QPushButton("")
         btn.setToolTip(tooltip)
         btn.setFixedSize(44, 42)
+        btn.setIcon(get_icon(icon_name, size=28, color="#a9b1d6"))
         btn.setStyleSheet(
-            "QPushButton { background-color: #444; color: #ccc; border: none; "
-            "border-radius: 3px; font-size: 30px; padding: 0; }"
-            "QPushButton:hover { background-color: #555; }"
+            "QPushButton { background-color: #3b4261; color: #c0caf5; border: none; "
+            "border-radius: 4px; padding: 0; }"
+            "QPushButton:hover { background-color: #565f89; }"
         )
         btn.clicked.connect(slot)
         return btn
@@ -320,6 +471,8 @@ class MainWindow(QMainWindow):
             self._local_proxy.mapFromSource(self._local_model.index(path))
         )
         self.local_path_bar.setText(path)
+        self._update_bookmark_buttons()
+        self._update_diff_highlighting()
 
     def _load_remote_path(self, path: str):
         """加载远程路径作为面板根目录（硬刷新）"""
@@ -327,6 +480,124 @@ class MainWindow(QMainWindow):
         self.remote_path_bar.setText(path)
         self._remote_fs.set_root_path(path)
         self.remote_tree.expandAll()
+        self._update_bookmark_buttons()
+        self._update_diff_highlighting()
+
+    # ─── 书签 ─────────────────────────────────────────────────
+
+    def _load_bookmarks(self):
+        settings = QSettings("sshtool", "bookmarks")
+        try:
+            local = settings.value("local_bookmarks", "[]")
+            remote = settings.value("remote_bookmarks", "[]")
+            self._local_bookmarks = json.loads(local) if local else []
+            self._remote_bookmarks = json.loads(remote) if remote else []
+        except (json.JSONDecodeError, TypeError):
+            self._local_bookmarks = []
+            self._remote_bookmarks = []
+
+    def _save_bookmarks(self):
+        settings = QSettings("sshtool", "bookmarks")
+        settings.setValue("local_bookmarks", json.dumps(self._local_bookmarks))
+        settings.setValue("remote_bookmarks", json.dumps(self._remote_bookmarks))
+
+    def _toggle_local_bookmark(self):
+        path = self.local_path_bar.text().strip()
+        if not path:
+            return
+        if path in self._local_bookmarks:
+            self._local_bookmarks.remove(path)
+        else:
+            self._local_bookmarks.append(path)
+        self._save_bookmarks()
+        self._update_bookmark_buttons()
+
+    def _toggle_remote_bookmark(self):
+        path = self.remote_path_bar.text().strip()
+        if not path:
+            return
+        if path in self._remote_bookmarks:
+            self._remote_bookmarks.remove(path)
+        else:
+            self._remote_bookmarks.append(path)
+        self._save_bookmarks()
+        self._update_bookmark_buttons()
+
+    def _update_bookmark_buttons(self):
+        if not hasattr(self, "remote_path_bar"):
+            return  # _build_ui 早期调用, 远程面板尚未创建
+        local = self.local_path_bar.text().strip()
+        remote = self.remote_path_bar.text().strip()
+        self.local_bookmark_btn.setIcon(
+            get_icon("star-fill", size=28, color="#e0af68") if local in self._local_bookmarks
+            else get_icon("star", size=28, color="#a9b1d6")
+        )
+        self.local_bookmark_btn.setToolTip(
+            "取消收藏" if local in self._local_bookmarks else "收藏当前路径"
+        )
+        self.remote_bookmark_btn.setIcon(
+            get_icon("star-fill", size=28, color="#e0af68") if remote in self._remote_bookmarks
+            else get_icon("star", size=28, color="#a9b1d6")
+        )
+        self.remote_bookmark_btn.setToolTip(
+            "取消收藏" if remote in self._remote_bookmarks else "收藏当前路径"
+        )
+        self._rebuild_bookmark_menu()
+
+    def _show_bookmark_menu(self, btn, pos, bookmarks, navigate_cb):
+        menu = QMenu()
+        if bookmarks:
+            for p in bookmarks:
+                action = menu.addAction(p)
+                action.triggered.connect(lambda checked, path=p: navigate_cb(path))
+            menu.addSeparator()
+        else:
+            menu.addAction("（暂无书签）").setEnabled(False)
+            menu.addSeparator()
+        menu.addAction("清除全部书签", lambda: self._clear_bookmarks(bookmarks))
+        menu.exec_(btn.mapToGlobal(pos))
+
+    def _clear_bookmarks(self, bookmarks):
+        bookmarks.clear()
+        self._save_bookmarks()
+        self._update_bookmark_buttons()
+
+    def _rebuild_bookmark_menu(self):
+        """重建菜单栏「书签」菜单，列出本地和远程书签"""
+        menu = self._bookmarks_menu
+        menu.clear()
+
+        # 本地书签
+        local_header = menu.addAction("📁 本地")
+        local_header.setEnabled(False)
+        if self._local_bookmarks:
+            for p in self._local_bookmarks:
+                action = menu.addAction(f"    {p}")
+                action.triggered.connect(lambda checked, path=p: self._set_local_root(path))
+        else:
+            empty = menu.addAction("    （暂无）")
+            empty.setEnabled(False)
+
+        menu.addSeparator()
+
+        # 远程书签
+        remote_header = menu.addAction("🌐 远程")
+        remote_header.setEnabled(False)
+        if self._remote_bookmarks:
+            for p in self._remote_bookmarks:
+                action = menu.addAction(f"    {p}")
+                action.triggered.connect(lambda checked, path=p: self._load_remote_path(path))
+        else:
+            empty = menu.addAction("    （暂无）")
+            empty.setEnabled(False)
+
+        menu.addSeparator()
+        menu.addAction("清除全部书签", lambda: (
+            self._local_bookmarks.clear(),
+            self._remote_bookmarks.clear(),
+            self._save_bookmarks(),
+            self._update_bookmark_buttons(),
+        ))
 
     def _navigate_local(self):
         path = self.local_path_bar.text().strip()
@@ -393,6 +664,8 @@ class MainWindow(QMainWindow):
             # 路径不在当前树中 → 回退到硬刷新
             self._load_remote_path(path)
 
+        self._update_diff_highlighting()
+
     def _is_tree_root_path(self, path: str) -> bool:
         """判断给定路径是否为当前树的根路径"""
         root = self._tree_root_path.rstrip("/") or "/"
@@ -406,19 +679,22 @@ class MainWindow(QMainWindow):
             self._set_local_root(path)
 
     def _on_remote_double_click(self, index: QModelIndex):
-        item = self._remote_fs.model.itemFromIndex(index)
+        src_index = self._remote_proxy.mapToSource(index)
+        item = self._remote_fs.model.itemFromIndex(src_index)
         if item is None or not self._remote_fs.is_dir(item):
             return
         path = self._remote_fs.get_full_path(item)
         self._load_remote_path(path)
 
     def _on_remote_expanded(self, index: QModelIndex):
-        item = self._remote_fs.model.itemFromIndex(index)
+        src_index = self._remote_proxy.mapToSource(index)
+        item = self._remote_fs.model.itemFromIndex(src_index)
         if item is None:
             return
         path = self._remote_fs.get_full_path(item)
         if self._remote_fs.is_dir(item) and not self._remote_fs.has_children_cached(path):
             self._remote_fs.expand_directory(path, item)
+        self._update_diff_highlighting()
 
     # ─── 选择 ─────────────────────────────────────────────────
 
@@ -435,12 +711,23 @@ class MainWindow(QMainWindow):
     def _on_remote_selection_changed(self):
         self._remote_paths = set()
         for idx in self.remote_tree.selectionModel().selectedRows():
-            item = self._remote_fs.model.itemFromIndex(idx)
+            src_idx = self._remote_proxy.mapToSource(idx)
+            item = self._remote_fs.model.itemFromIndex(src_idx)
             if item:
                 path = self._remote_fs.get_full_path(item)
                 if path:
                     self._remote_paths.add(path)
         self.remote_selection_label.setText(f"已选: {len(self._remote_paths)} 项")
+
+    # ─── 搜索过滤 ─────────────────────────────────────────────
+
+    def _on_local_search(self, text: str):
+        """本地文件搜索过滤 —— 即时隐藏不匹配的行"""
+        self._local_proxy.setFilterFixedString(text)
+
+    def _on_remote_search(self, text: str):
+        """远程文件搜索过滤 —— 即时隐藏不匹配的行"""
+        self._remote_proxy.setFilterFixedString(text)
 
     # ─── 传输请求 ─────────────────────────────────────────────
 
@@ -474,6 +761,40 @@ class MainWindow(QMainWindow):
 
         self._show_transfer_dialog(sources, dest, direction)
 
+    def _request_preview(self):
+        """预览传输变更: 先确认方向，再确认选项，然后执行 dry-run 并展示预览对话框"""
+        # 根据选中内容自动判断方向
+        if self._local_paths:
+            direction = "push"
+            sources = list(self._local_paths)
+            dest = self.remote_path_bar.text().strip()
+        elif self._remote_paths:
+            direction = "pull"
+            sources = list(self._remote_paths)
+            dest = self.local_path_bar.text().strip()
+        else:
+            QMessageBox.warning(self, "提示", "请先在左侧或右侧选择要预览传输的文件或文件夹")
+            return
+
+        # 显示选项对话框（与正常传输相同）
+        dlg = RsyncOptionsDialog(
+            self._default_rsync_opts, sources, dest, direction, self
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            self._log("预览传输已取消")
+            return
+
+        rsync_opts = dlg.get_options()
+
+        if dlg.save_as_default():
+            self._default_rsync_opts = rsync_opts
+            self._log("已保存为默认 Rsync 选项")
+
+        # 以 dry_run 模式启动传输，等待预览结果
+        self._queue.add_task(
+            sources, dest, direction, rsync_opts, dry_run=True,
+        )
+
     def _show_transfer_dialog(self, sources: list, dest: str, direction: str):
         """显示传输确认对话框"""
         dlg = RsyncOptionsDialog(
@@ -493,83 +814,106 @@ class MainWindow(QMainWindow):
 
     def _start_transfer(self, sources: list, dest: str,
                         direction: str, rsync_opts: RsyncOptions):
-        """启动传输。隧道由 MainWindow 维护，TransferEngine 只做 rsync"""
-        if self._transfer_engine and self._transfer_engine.isRunning():
-            QMessageBox.warning(self, "提示", "已有传输在进行中")
-            return
-
-        # 记录传输目标，用于完成后局部刷新
-        self._last_transfer_dest = dest
-        self._last_transfer_direction = direction
-
-        # 确保隧道已连接
-        if not self._tunnel_connected:
-            self._log("隧道未连接，正在自动连接...")
-            if not self._connect_tunnel(silent=True):
-                QMessageBox.critical(self, "连接失败",
-                                     "无法建立 SSH 隧道，请检查连接配置")
-                return
-
-        self._transfer_engine = TransferEngine(
-            self._config, rsync_opts, sources, dest, direction,
-            tunnel_port=self._config["tunnel_port"],
+        """启动传输: 加入后台队列执行, 不阻塞浏览与继续添加任务"""
+        self._queue.add_task(
+            sources, dest, direction, rsync_opts,
             dry_run=self.dry_run_cb.isChecked(),
         )
-        self._transfer_engine.log_message.connect(self._log)
-        self._transfer_engine.transfer_progress.connect(self._on_progress)
-        self._transfer_engine.transfer_done.connect(self._on_transfer_done)
-        self._transfer_engine.tunnel_lost.connect(self._on_tunnel_lost)
-
-        self._set_transfer_ui(True)
-        self._transfer_engine.start()
 
     def _stop_transfer(self):
-        if self._transfer_engine and self._transfer_engine.isRunning():
-            self._transfer_engine.cancel()
-            self._log("正在取消传输...")
+        self._queue.cancel_running()
+        self._log("正在取消当前任务...")
+
+    def _on_preview_result(self, task, preview_data: dict):
+        """接收 dry-run 预览结果，弹出预览对话框"""
+        total = sum(len(v) for v in preview_data.values())
+        if total == 0:
+            QMessageBox.information(self, "传输预览", "无变更 — 两端文件已完全同步。")
+            return
+        dlg = TransferPreviewDialog(preview_data, task.direction, self)
+        dlg.exec_()
 
     def _on_tunnel_lost(self):
-        """TransferEngine 检测到隧道断开"""
+        """TransferEngine 检测到隧道断开: 异步自动重连, 结果由 _on_connect_done 记录"""
         self._log("⚠ 隧道已断开，正在自动重连...")
         self._tunnel_connected = False
         self._update_tunnel_buttons()
-        if self._connect_tunnel(silent=True):
-            self._log("✓ 隧道已自动重连，请重试传输")
-        else:
-            self._log("✗ 自动重连失败，请手动检查连接配置")
+        if not self._connect_tunnel(silent=True):
+            self._log("✗ 自动重连未启动，请手动检查连接配置")
 
-    def _on_progress(self, line: str, percent: int):
-        self.progress_bar.setVisible(True)
-        if percent >= 0:
-            self.progress_bar.setValue(percent)
-        elif self.progress_bar.value() == 0:
-            self.progress_bar.setRange(0, 0)  # 不确定模式
+    # ─── 任务队列 ─────────────────────────────────────────────
 
-    def _on_transfer_done(self, success: bool, message: str):
-        self._set_transfer_ui(False)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 100)
-        if success:
-            self.progress_bar.setValue(100)
+    def _connect_queue(self):
+        q = self._queue
+        q.task_added.connect(self._on_task_added)
+        q.task_started.connect(self._on_task_started)
+        q.task_progress.connect(self._on_task_progress)
+        q.task_log.connect(self._on_task_log)
+        q.task_finished.connect(self._on_task_finished)
+        q.tunnel_lost.connect(self._on_tunnel_lost)
+        q.preview_result.connect(self._on_preview_result)
+
+    def _on_task_added(self, task):
+        row = TaskRowWidget(task)
+        row.cancel_requested.connect(self._queue.cancel)
+        item = QListWidgetItem()
+        item.setSizeHint(row.sizeHint())
+        self.task_list.addItem(item)
+        self.task_list.setItemWidget(item, row)
+        self._task_rows[task.id] = row
+        self._update_task_tab_label()
+
+    def _on_task_started(self, task):
+        row = self._task_rows.get(task.id)
+        if row:
+            row.set_status("传输中", "#7aa2f7")
+        self._update_stop_button()
+
+    def _on_task_progress(self, task, line: str, pct: int):
+        row = self._task_rows.get(task.id)
+        if row:
+            row.set_progress(pct)
+            if pct >= 0:
+                row.set_status(f"传输中 {pct}%", "#7aa2f7")
+
+    def _on_task_log(self, task, msg: str):
+        self._log(f"[任务{task.id}] {msg}")
+
+    def _on_task_finished(self, task):
+        row = self._task_rows.get(task.id)
+        if row:
+            row.cancel_btn.setEnabled(False)
+            if task.status == DONE:
+                row.set_progress(100)
+                row.set_status("✓ 完成", "#9ece6a")
+            elif task.status == FAILED:
+                row.set_status(f"✗ 失败: {task.message}", "#f7768e")
+            else:
+                row.set_status("已取消", "#565f89")
+
+        if task.status == DONE:
             self.status_bar.showMessage("✓ 传输完成", 5000)
             # 局部刷新受影响的目录，保留树展开状态
-            self._refresh_after_transfer()
-        else:
-            self.progress_bar.setValue(0)
-            self.status_bar.showMessage(f"✗ {message}", 8000)
-        # 传输结束，清除跟踪信息
-        self._last_transfer_dest = ""
-        self._last_transfer_direction = ""
+            self._refresh_after_transfer(task.dest, task.direction)
+        elif task.status == FAILED:
+            self.status_bar.showMessage(f"✗ {task.message}", 8000)
 
-    def _refresh_after_transfer(self):
+        self._update_task_tab_label()
+        self._update_stop_button()
+
+    def _update_task_tab_label(self):
+        count = self.task_list.count()
+        self._bottom_tabs.setTabText(0, f"任务 ({count})")
+
+    def _update_stop_button(self):
+        self.stop_btn.setEnabled(self._queue.running)
+
+    def _refresh_after_transfer(self, dest: str, direction: str):
         """传输完成后局部刷新受影响的目录，不清除整棵树。
 
         仅刷新传输目标目录（或当前路径栏目录作为回退），
         避免原本展开的树状结构瞬间闭合。
         """
-        dest = self._last_transfer_dest
-        direction = self._last_transfer_direction
-
         if direction == "push" and dest:
             # 推送 → 刷新远程目标目录
             item = self._remote_fs.find_item_for_path(dest)
@@ -593,87 +937,95 @@ class MainWindow(QMainWindow):
             if self._tunnel_connected:
                 self._remote_refresh_current()
 
-    def _set_transfer_ui(self, active: bool):
-        self.sync_btn.setEnabled(not active)
-        self.push_btn.setEnabled(not active)
-        self.pull_btn.setEnabled(not active)
-        self.stop_btn.setEnabled(active)
-        if not active:
-            self.progress_bar.setVisible(False)
-            self.progress_bar.reset()
+        self._update_diff_highlighting()
 
     # ─── 隧道管理 ─────────────────────────────────────────────
 
-    def _connect_tunnel(self, silent: bool = False):
-        """建立 SSH 隧道并加载远程目录。silent=True 时不弹错误框"""
+    def _tunnel_state(self) -> str:
+        """隧道状态: connected / connecting / disconnected"""
+        if self._tunnel_connected:
+            return "connected"
+        if self._connecting:
+            return "connecting"
+        return "disconnected"
+
+    def _connect_tunnel(self, silent: bool = False) -> bool:
+        """异步建立 SSH 隧道并加载远程目录, 不阻塞界面。
+
+        返回 True 表示已连接或已开始连接; 结果由 _on_connect_done 处理。
+        """
         if self._tunnel_connected:
             if not silent:
                 self._log("隧道已连接")
             return True
+        if self._connecting:
+            return False
+        self._connecting = True
+        self._connect_aborted = False
         if not silent:
             self._log("正在建立 SSH 隧道...")
         self.tunnel_status_label.setText("● 连接中...")
-        self.tunnel_status_label.setStyleSheet("color: #ffaa44;")
+        self.tunnel_status_label.setStyleSheet("color: #e0af68;")
         self._update_tunnel_buttons()
 
-        cfg = self._config
-        try:
-            self._tunnel_proc = open_tunnel(cfg)
-            time.sleep(2.0)
-            if self._tunnel_proc.poll() is not None:
-                stderr = self._tunnel_proc.stderr.read().decode(errors="replace")
-                self._log(f"✗ 隧道建立失败: {stderr}")
-                self.tunnel_status_label.setText("● 连接失败")
-                self.tunnel_status_label.setStyleSheet("color: #ff4444;")
-                self._tunnel_proc = None
-                self._update_tunnel_buttons()
-                if not silent:
-                    QMessageBox.critical(self, "连接失败", f"SSH 隧道建立失败:\n{stderr}")
-                return False
+        self._connector = TunnelConnector(self._config, self._config["rk_base_path"], self)
+        self._connector.tunnel_opened.connect(self._on_tunnel_opened)
+        self._connector.finished_connect.connect(
+            lambda ok, msg, entries, silent=silent:
+                self._on_connect_done(ok, msg, entries, silent))
+        self._connector.start()
+        return True
 
-            # 验证隧道
-            alive, msg = check_tunnel(cfg)
-            if not alive:
-                self._log(f"✗ 隧道验证失败: {msg}")
-                self.tunnel_status_label.setText("● 验证失败")
-                self.tunnel_status_label.setStyleSheet("color: #ff4444;")
-                self._disconnect_tunnel()
-                if not silent:
-                    QMessageBox.critical(self, "连接失败", f"隧道验证失败:\n{msg}")
-                return False
+    def _on_tunnel_opened(self, proc):
+        self._tunnel_proc = proc
 
-            # 成功
-            self._tunnel_connected = True
-            self.tunnel_status_label.setText("● 已连接")
-            self.tunnel_status_label.setStyleSheet("color: #88ff88;")
-            self._update_tunnel_buttons()
-            self._log(f"✓ 隧道已连接 (PID={self._tunnel_proc.pid})")
-            self.status_bar.showMessage("隧道已连接 — 正在加载远程目录...", 3000)
+    def _on_connect_done(self, ok: bool, msg: str, entries, silent: bool):
+        self._connecting = False
+        self._connector = None
+        self._update_tunnel_buttons()
 
-            # 加载远程目录
-            self._remote_fs.config = cfg
-            self._remote_fs.set_root_path(cfg["rk_base_path"])
-            self.remote_tree.expandAll()
+        if self._connect_aborted:
+            self._log("隧道连接已取消")
+            self._tunnel_proc = None
+            self._queue.tunnel_result(False)
+            return
 
-            # 检查是否加载成功
-            if self._remote_fs.model.rowCount() == 0:
-                self._log("⚠ 远程目录为空或无法访问，请检查远程基础路径")
-            else:
-                self._log(f"✓ 远程目录已加载: {cfg['rk_base_path']}")
-
-            return True
-
-        except Exception as e:
-            self._log(f"✗ 隧道连接异常: {e}")
+        if not ok:
+            self._log(f"✗ {msg}")
             self.tunnel_status_label.setText("● 连接失败")
-            self.tunnel_status_label.setStyleSheet("color: #ff4444;")
-            self._disconnect_tunnel()
+            self.tunnel_status_label.setStyleSheet("color: #f7768e;")
+            self._tunnel_proc = None
             if not silent:
-                QMessageBox.critical(self, "连接失败", str(e))
-            return False
+                QMessageBox.critical(self, "连接失败", msg)
+            self._queue.tunnel_result(False)
+            return
+
+        # 成功
+        self._tunnel_connected = True
+        self.tunnel_status_label.setText("● 已连接")
+        self.tunnel_status_label.setStyleSheet("color: #9ece6a;")
+        self._update_tunnel_buttons()
+        self._log(f"✓ 隧道已连接 (PID={self._tunnel_proc.pid})")
+        self.status_bar.showMessage("隧道已连接 — 正在加载远程目录...", 3000)
+
+        # 加载远程目录(列表已在后台线程预取, 这里只填充模型)
+        self._remote_fs.config = self._config
+        self._remote_fs.apply_root_listing(self._config["rk_base_path"], entries or [])
+        self.remote_tree.expandAll()
+
+        # 检查是否加载成功
+        if self._remote_proxy.sourceModel().rowCount() == 0:
+            self._log("⚠ 远程目录为空或无法访问，请检查远程基础路径")
+        else:
+            self._log(f"✓ 远程目录已加载: {self._config['rk_base_path']}")
+
+        self._queue.tunnel_result(True)
 
     def _disconnect_tunnel(self):
-        """断开通路"""
+        """断开通路(连接中则取消连接)"""
+        if self._connecting and self._connector:
+            self._connect_aborted = True
+            self._connector.cancel()
         if hasattr(self, '_tunnel_proc') and self._tunnel_proc:
             try:
                 self._tunnel_proc.terminate()
@@ -683,14 +1035,14 @@ class MainWindow(QMainWindow):
             self._tunnel_proc = None
         self._tunnel_connected = False
         self.tunnel_status_label.setText("● 未连接")
-        self.tunnel_status_label.setStyleSheet("color: #ff8888;")
+        self.tunnel_status_label.setStyleSheet("color: #f7768e;")
         self._update_tunnel_buttons()
         self._log("隧道已断开")
 
     def _update_tunnel_buttons(self):
         """更新连接/断开按钮状态"""
-        self.connect_btn.setEnabled(not self._tunnel_connected)
-        self.disconnect_btn.setEnabled(self._tunnel_connected)
+        self.connect_btn.setEnabled(not self._tunnel_connected and not self._connecting)
+        self.disconnect_btn.setEnabled(self._tunnel_connected or self._connecting)
 
     def _test_connection(self):
         """测试连接：成功后询问是否保持连接"""
@@ -713,6 +1065,70 @@ class MainWindow(QMainWindow):
             self._connect_tunnel()
 
     # ─── 配置 ─────────────────────────────────────────────────
+
+    def _reload_profile_combo(self):
+        self._loading_profiles = True
+        self.profile_combo.clear()
+        self.profile_combo.addItems(self._config_mgr.profiles())
+        self.profile_combo.setCurrentText(self._config_mgr.current_profile)
+        self._loading_profiles = False
+
+    def _apply_config(self, cfg: dict, reconnect: bool):
+        """应用新环境配置; 原隧道已连接时自动重连"""
+        self._config = cfg
+        self._remote_fs.config = cfg
+        self.remote_path_bar.setText(cfg["rk_base_path"])
+
+        fs = clamp_font(cfg.get("font_size", 25))
+        if fs != self._font_size:
+            self._font_size = fs
+            self._apply_font_size()
+
+        if reconnect:
+            self._disconnect_tunnel()
+            self._connect_tunnel()
+
+    def _on_profile_changed(self, name: str):
+        if self._loading_profiles or not name:
+            return
+        mgr = self._config_mgr
+        if name == mgr.current_profile:
+            return
+        # 先保存当前环境的修改, 再切换
+        mgr.save_profile(mgr.current_profile, self._config)
+        cfg = mgr.switch_profile(name)
+        self._apply_config(cfg, reconnect=self._tunnel_connected)
+        self._log(f"已切换到环境「{name}」")
+
+    def _add_profile(self):
+        name, ok = QInputDialog.getText(self, "新建环境", "环境名称:", QLineEdit.Normal, "")
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        mgr = self._config_mgr
+        if name in mgr.profiles():
+            QMessageBox.warning(self, "提示", f"环境「{name}」已存在")
+            return
+        mgr.add_profile(name, self._config)  # 以当前配置为副本
+        mgr.switch_profile(name)
+        self._reload_profile_combo()
+        self._log(f"已创建并切换到环境「{name}」")
+
+    def _delete_profile(self):
+        mgr = self._config_mgr
+        if len(mgr.profiles()) <= 1:
+            QMessageBox.warning(self, "提示", "至少需要保留一个环境")
+            return
+        name = mgr.current_profile
+        if QMessageBox.question(
+            self, "删除环境", f"确定删除环境「{name}」?",
+            QMessageBox.Yes | QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        mgr.delete_profile(name)
+        self._apply_config(mgr.config, reconnect=self._tunnel_connected)
+        self._reload_profile_combo()
+        self._log(f"已删除环境「{name}」, 当前环境「{mgr.current_profile}」")
 
     def _open_config_dialog(self):
         dlg = ConfigDialog(self._config, self)
@@ -765,6 +1181,93 @@ class MainWindow(QMainWindow):
             make_stylesheet(self._font_size)
         )
 
+    # ─── 差异高亮 ─────────────────────────────────────────────
+
+    def _get_local_file_info(self) -> dict:
+        """获取本地当前目录下的文件信息。
+
+        返回 {filename: (size, mtime_unix)}，仅包含文件（不含目录）。
+        """
+        root_idx = self.local_tree.rootIndex()
+        if not root_idx.isValid():
+            return {}
+        src_idx = self._local_proxy.mapToSource(root_idx)
+        model = self._local_model
+        files = {}
+        for row in range(model.rowCount(src_idx)):
+            child_idx = model.index(row, 0, src_idx)
+            fi = model.fileInfo(child_idx)
+            if not fi.isDir():
+                try:
+                    mtime = int(fi.lastModified().toSecsSinceEpoch())
+                except (ValueError, OSError):
+                    mtime = 0
+                files[fi.fileName()] = (fi.size(), mtime)
+        return files
+
+    def _get_remote_file_info(self) -> dict:
+        """获取远程当前目录下的文件信息。
+
+        返回 {filename: (size, mtime_unix)}，仅包含文件，依赖 RemoteFileSystemModel 缓存。
+        """
+        path = self.remote_path_bar.text().strip()
+        if not path or not self._tunnel_connected:
+            return {}
+        entries = self._remote_fs._cache.get(path)
+        if entries is None:
+            return {}
+        files = {}
+        for name, is_dir, size, mtime in entries:
+            if not is_dir:
+                files[name] = (size, mtime)
+        return files
+
+    def _update_diff_highlighting(self):
+        """对比本地/远程当前目录中的文件，更新两个面板的差异高亮数据。
+
+        比较规则（按优先级）：
+          1. 仅本地有 → DiffStatus.ONLY_LOCAL
+          2. 仅远程有 → DiffStatus.ONLY_REMOTE
+          3. 大小不同 → DiffStatus.SIZE_DIFFERS
+          4. 本地较新（mtime 差 > 2s）→ DiffStatus.LOCAL_NEWER
+          5. 远程较新（mtime 差 > 2s）→ DiffStatus.REMOTE_NEWER
+          6. 一致 → DiffStatus.SAME
+        """
+        # 委托尚未创建时跳过（初始化阶段 _set_local_root 在 delegate 创建前调用）
+        if not hasattr(self, '_local_diff') or not hasattr(self, '_remote_diff'):
+            return
+
+        local_files = self._get_local_file_info()
+        remote_files = self._get_remote_file_info()
+
+        all_names = set(local_files.keys()) | set(remote_files.keys())
+        diff = {}
+        for name in all_names:
+            in_local = name in local_files
+            in_remote = name in remote_files
+
+            if in_local and not in_remote:
+                diff[name] = DiffStatus.ONLY_LOCAL
+            elif not in_local and in_remote:
+                diff[name] = DiffStatus.ONLY_REMOTE
+            else:
+                l_size, l_mtime = local_files[name]
+                r_size, r_mtime = remote_files[name]
+                if l_size != r_size:
+                    diff[name] = DiffStatus.SIZE_DIFFERS
+                elif l_mtime > r_mtime + 2:
+                    diff[name] = DiffStatus.LOCAL_NEWER
+                elif r_mtime > l_mtime + 2:
+                    diff[name] = DiffStatus.REMOTE_NEWER
+                else:
+                    diff[name] = DiffStatus.SAME
+
+        self._local_diff.set_diff_data(diff)
+        self._remote_diff.set_diff_data(diff)
+        # 触发重绘
+        self.local_tree.viewport().update()
+        self.remote_tree.viewport().update()
+
     # ─── 日志 ─────────────────────────────────────────────────
 
     def _log(self, msg: str):
@@ -781,13 +1284,20 @@ class MainWindow(QMainWindow):
         settings = QSettings("sshtool", "gui")
         settings.setValue("geometry", self.saveGeometry())
 
+        # 取消进行中的隧道连接
+        if self._connecting and self._connector:
+            self._connect_aborted = True
+            self._connector.cancel()
+            self._connector.wait(3000)
+
+        # 等待后台目录获取结束
+        self._remote_fs.shutdown(3000)
+
+        # 停止所有传输任务
+        self._queue.shutdown(3000)
+
         # 断开隧道
         self._disconnect_tunnel()
-
-        # 停止传输
-        if self._transfer_engine and self._transfer_engine.isRunning():
-            self._transfer_engine.cancel()
-            self._transfer_engine.wait(3000)
 
         event.accept()
 
