@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import shutil
 import sys
 
@@ -20,7 +21,7 @@ from .dialogs import ConfigDialog, RsyncOptionsDialog, TransferPreviewDialog
 from .icons import get_icon
 from .remote_fs import RemoteFileSystemModel
 from .rsync_options import RsyncOptions
-from .ssh_utils import TunnelConnector, test_tunnel_flow
+from .ssh_utils import TunnelConnector, run_ssh, test_tunnel_flow
 from .tasks import CANCELLED, DONE, FAILED, TransferQueue
 from .transfer_engine import TransferEngine
 from .tree_views import DragDropTreeView, DiffHighlightDelegate, DiffStatus, LocalFileProxyModel, RemoteFileFilterProxy
@@ -121,6 +122,9 @@ class MainWindow(QMainWindow):
         geo = settings.value("geometry")
         if geo:
             self.restoreGeometry(geo)
+        splitter_state = settings.value("splitter_state")
+        if splitter_state:
+            self._main_splitter.restoreState(splitter_state)
 
         # 加载书签
         self._load_bookmarks()
@@ -376,25 +380,32 @@ class MainWindow(QMainWindow):
         # 底部面板 — 任务列表 + 日志
         self._bottom_tabs = QTabWidget()
         self._bottom_tabs.setDocumentMode(True)
+        self._bottom_tabs.setMinimumHeight(48)  # 允许拉伸到很小
 
         self.task_list = QListWidget()
-        self.task_list.setMaximumHeight(200)
         self._bottom_tabs.addTab(self.task_list, "任务")
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumHeight(150)
         self.log_view.setFont(QFont("DejaVu Sans Mono", 13))
         self._bottom_tabs.addTab(self.log_view, "日志")
 
-        # 主布局：工具栏 → 分割器 → 底部面板
+        # 主布局：工具栏 → 垂直分割器(双栏树 / 底部面板可上下拉伸)
+        main_splitter = QSplitter(Qt.Vertical)
+        main_splitter.addWidget(splitter)
+        main_splitter.addWidget(self._bottom_tabs)
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 0)
+        main_splitter.setCollapsible(0, False)  # 树面板不可完全折叠
+        main_splitter.setSizes([620, 170])
+        self._main_splitter = main_splitter
+
         main_widget = QWidget()
         main_layout = QVBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         main_layout.addWidget(toolbar_widget, 0)
-        main_layout.addWidget(splitter, 1)
-        main_layout.addWidget(self._bottom_tabs, 0)
+        main_layout.addWidget(main_splitter, 1)
         self.setCentralWidget(main_widget)
 
         # 状态栏
@@ -448,6 +459,18 @@ class MainWindow(QMainWindow):
         # 搜索过滤
         self.local_search.textChanged.connect(self._on_local_search)
         self.remote_search.textChanged.connect(self._on_remote_search)
+
+        # 右键上下文菜单 — 本地
+        self.local_tree.context_new_folder.connect(self._local_context_new_folder)
+        self.local_tree.context_rename.connect(self._local_context_rename)
+        self.local_tree.context_delete.connect(self._local_context_delete)
+        self.local_tree.context_refresh.connect(self._local_refresh)
+
+        # 右键上下文菜单 — 远程
+        self.remote_tree.context_new_folder.connect(self._remote_context_new_folder)
+        self.remote_tree.context_rename.connect(self._remote_context_rename)
+        self.remote_tree.context_delete.connect(self._remote_context_delete)
+        self.remote_tree.context_refresh.connect(self._remote_refresh_current)
 
     # ─── 导航 ─────────────────────────────────────────────────
 
@@ -728,6 +751,143 @@ class MainWindow(QMainWindow):
     def _on_remote_search(self, text: str):
         """远程文件搜索过滤 —— 即时隐藏不匹配的行"""
         self._remote_proxy.setFilterFixedString(text)
+
+    # ─── 右键上下文菜单 ─────────────────────────────────────
+
+    def _local_context_new_folder(self, parent_path: str):
+        """在本地指定目录中新建文件夹"""
+        name, ok = QInputDialog.getText(
+            self, "新建文件夹", "文件夹名称:", QLineEdit.Normal, "")
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        new_path = os.path.join(parent_path, name)
+        try:
+            os.makedirs(new_path, exist_ok=False)
+            self._log(f"✓ 已创建本地目录: {new_path}")
+            self._local_refresh()
+        except FileExistsError:
+            QMessageBox.warning(self, "提示", f"目录已存在: {name}")
+        except OSError as e:
+            QMessageBox.critical(self, "错误", f"创建目录失败:\n{e}")
+
+    def _local_context_rename(self, old_path: str):
+        """重命名本地文件或目录"""
+        old_name = os.path.basename(old_path)
+        name, ok = QInputDialog.getText(
+            self, "重命名", "新名称:", QLineEdit.Normal, old_name)
+        name = name.strip() if ok else ""
+        if not name or name == old_name:
+            return
+        new_path = os.path.join(os.path.dirname(old_path), name)
+        try:
+            os.rename(old_path, new_path)
+            self._log(f"✓ 已重命名: {old_name} → {name}")
+            self._local_refresh()
+        except OSError as e:
+            QMessageBox.critical(self, "错误", f"重命名失败:\n{e}")
+
+    def _local_context_delete(self, paths: list):
+        """删除本地文件或目录（含确认对话框）"""
+        if not paths:
+            return
+        names = "\n".join(f"  • {p}" for p in paths)
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除以下 {len(paths)} 项吗？\n\n{names}\n\n此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for p in paths:
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+                self._log(f"✓ 已删除: {p}")
+            except OSError as e:
+                QMessageBox.critical(self, "错误", f"删除失败:\n{p}\n{e}")
+        self._local_refresh()
+
+    def _remote_context_new_folder(self, parent_path: str):
+        """在远程指定目录中新建文件夹"""
+        if not self._tunnel_connected:
+            QMessageBox.warning(self, "提示", "请先连接远程隧道")
+            return
+        name, ok = QInputDialog.getText(
+            self, "新建文件夹", "文件夹名称:", QLineEdit.Normal, "")
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        remote_path = f"{parent_path.rstrip('/')}/{name}"
+        cmd = f"mkdir -p {shlex.quote(remote_path)}"
+        try:
+            result = run_ssh(self._config, cmd)
+            if result.returncode == 0:
+                self._log(f"✓ 已创建远程目录: {remote_path}")
+                self._remote_refresh_current()
+            else:
+                QMessageBox.critical(
+                    self, "错误",
+                    f"创建远程目录失败:\n{result.stderr.strip() or '未知错误'}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{e}")
+
+    def _remote_context_rename(self, old_path: str):
+        """重命名远程文件或目录"""
+        if not self._tunnel_connected:
+            QMessageBox.warning(self, "提示", "请先连接远程隧道")
+            return
+        old_name = os.path.basename(old_path)
+        name, ok = QInputDialog.getText(
+            self, "重命名", "新名称:", QLineEdit.Normal, old_name)
+        name = name.strip() if ok else ""
+        if not name or name == old_name:
+            return
+        new_path = os.path.join(os.path.dirname(old_path), name)
+        cmd = f"mv {shlex.quote(old_path)} {shlex.quote(new_path)}"
+        try:
+            result = run_ssh(self._config, cmd)
+            if result.returncode == 0:
+                self._log(f"✓ 已重命名: {old_name} → {name}")
+                self._remote_refresh_current()
+            else:
+                QMessageBox.critical(
+                    self, "错误",
+                    f"重命名失败:\n{result.stderr.strip() or '未知错误'}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{e}")
+
+    def _remote_context_delete(self, paths: list):
+        """删除远程文件或目录（含确认对话框）"""
+        if not self._tunnel_connected:
+            QMessageBox.warning(self, "提示", "请先连接远程隧道")
+            return
+        if not paths:
+            return
+        names = "\n".join(f"  • {p}" for p in paths)
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除以下 {len(paths)} 个远程项目吗？\n\n{names}\n\n此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for p in paths:
+            # 使用 rm -rf 以同时处理文件和目录
+            cmd = f"rm -rf {shlex.quote(p)}"
+            try:
+                result = run_ssh(self._config, cmd)
+                if result.returncode == 0:
+                    self._log(f"✓ 已删除远程项目: {p}")
+                else:
+                    QMessageBox.critical(
+                        self, "错误",
+                        f"删除失败:\n{p}\n{result.stderr.strip() or '未知错误'}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"SSH 命令执行失败:\n{p}\n{e}")
+        self._remote_refresh_current()
 
     # ─── 传输请求 ─────────────────────────────────────────────
 
@@ -1280,9 +1440,10 @@ class MainWindow(QMainWindow):
     # ─── 生命周期 ─────────────────────────────────────────────
 
     def closeEvent(self, event):
-        # 保存窗口几何
+        # 保存窗口几何与分割器状态
         settings = QSettings("sshtool", "gui")
         settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("splitter_state", self._main_splitter.saveState())
 
         # 取消进行中的隧道连接
         if self._connecting and self._connector:

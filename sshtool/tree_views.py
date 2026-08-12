@@ -106,9 +106,15 @@ class RemoteFileFilterProxy(QSortFilterProxyModel):
 
 
 class DragDropTreeView(QTreeView):
-    """自定义 TreeView，支持文件拖放传输"""
+    """自定义 TreeView，支持文件拖放传输与右键上下文菜单"""
 
     drop_requested = pyqtSignal(list, str, str)  # (源路径列表, 目标路径, 方向 push/pull)
+
+    # 右键上下文菜单信号
+    context_new_folder = pyqtSignal(str)   # parent_path — 将在其中创建新目录
+    context_rename = pyqtSignal(str)       # path — 要重命名的项目路径
+    context_delete = pyqtSignal(list)      # paths — 要删除的项目路径列表
+    context_refresh = pyqtSignal()         # 刷新当前目录
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -282,6 +288,60 @@ class DragDropTreeView(QTreeView):
 
     def mimeTypes(self):
         return ["application/x-sshtool-paths", "text/uri-list", "text/plain"]
+
+    def contextMenuEvent(self, event):
+        """右键上下文菜单: 新建文件夹、重命名、删除、刷新"""
+        from PyQt5.QtWidgets import QMenu
+
+        menu = QMenu(self)
+
+        # ── 确定点击目标 ──
+        idx = self.indexAt(event.pos())
+        selected_indexes = self.selectionModel().selectedRows()
+
+        # 收集当前面板的根路径（用于"新建文件夹"的默认父目录）
+        root_path = self._path_for_index(self.rootIndex()) if self.rootIndex().isValid() else ""
+
+        if idx.isValid():
+            clicked_path = self._path_for_index(idx)
+            is_dir = self._is_dir_item(idx)
+
+            # ── 多选时仅支持删除 ──
+            if len(selected_indexes) > 1 and idx in selected_indexes:
+                selected_paths = [self._path_for_index(i) for i in selected_indexes]
+                selected_paths = [p for p in selected_paths if p]
+                if selected_paths:
+                    del_action = menu.addAction("删除选中项")
+                    del_action.triggered.connect(
+                        lambda: self.context_delete.emit(selected_paths))
+                menu.addSeparator()
+                menu.addAction("刷新", lambda: self.context_refresh.emit())
+                menu.exec_(event.globalPos())
+                return
+
+            # ── 单项操作 ──
+            if is_dir:
+                # 点击目录: 新建文件夹在目录内创建
+                parent_for_new = clicked_path
+                menu.addAction("新建文件夹", lambda: self.context_new_folder.emit(parent_for_new))
+                menu.addSeparator()
+                menu.addAction("重命名", lambda: self.context_rename.emit(clicked_path))
+                menu.addAction("删除", lambda: self.context_delete.emit([clicked_path]))
+            else:
+                # 点击文件: 新建文件夹在父目录中创建
+                parent_dir = os.path.dirname(clicked_path) if clicked_path else root_path
+                menu.addAction("新建文件夹", lambda: self.context_new_folder.emit(parent_dir))
+                menu.addSeparator()
+                menu.addAction("重命名", lambda: self.context_rename.emit(clicked_path))
+                menu.addAction("删除", lambda: self.context_delete.emit([clicked_path]))
+        else:
+            # 点击空白区域: 新建文件夹在当前根目录
+            if root_path:
+                menu.addAction("新建文件夹", lambda: self.context_new_folder.emit(root_path))
+
+        menu.addSeparator()
+        menu.addAction("刷新", lambda: self.context_refresh.emit())
+        menu.exec_(event.globalPos())
 
 
 # ─── Diff Status ───────────────────────────────────────────────
