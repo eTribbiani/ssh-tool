@@ -197,4 +197,16 @@ class TransferQueue(QObject):
             self._engine.wait(3000)
             self._engine = None
         self.task_finished.emit(task)
+        self._prune_tasks()
         self._start_next()
+
+    def _prune_tasks(self):
+        """清理已完成/失败/取消的历史任务对象, 防止内存无限增长"""
+        limit = 500
+        if len(self._tasks) <= limit:
+            return
+        for tid, t in list(self._tasks.items()):
+            if len(self._tasks) <= limit:
+                break
+            if t.status in (DONE, FAILED, CANCELLED) and t is not self._current:
+                del self._tasks[tid]

@@ -248,10 +248,13 @@ class RsyncOptionsDialog(QDialog):
 class ConfigDialog(QDialog):
     """连接配置编辑对话框"""
 
-    def __init__(self, config: dict, parent=None):
+    def __init__(self, config: dict, parent=None, profile_name: str = None):
         super().__init__(parent)
         self.config = dict(config)
-        self.setWindowTitle("编辑连接配置")
+        title = "编辑连接配置"
+        if profile_name:
+            title += f" — {profile_name}"
+        self.setWindowTitle(title)
         self.setMinimumWidth(500)
         self._build_ui()
 

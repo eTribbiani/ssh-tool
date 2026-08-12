@@ -6,7 +6,7 @@ import shlex
 import shutil
 import sys
 
-from PyQt5.QtCore import QDir, QModelIndex, QSettings, Qt, pyqtSignal
+from PyQt5.QtCore import QDir, QModelIndex, QSettings, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog, QFileSystemModel,
@@ -23,6 +23,7 @@ from .remote_fs import RemoteFileSystemModel
 from .rsync_options import RsyncOptions
 from .ssh_utils import RemoteCommandWorker, TunnelConnector, run_ssh, test_tunnel_flow
 from .tasks import CANCELLED, DONE, FAILED, TransferQueue
+from .terminal_panel import TERM_LOCAL, TERM_REMOTE, TerminalManager
 from .transfer_engine import TransferEngine
 from .tree_views import DragDropTreeView, DiffHighlightDelegate, DiffStatus, LocalFileProxyModel, RemoteFileFilterProxy
 
@@ -35,7 +36,7 @@ class TaskRowWidget(QWidget):
     def __init__(self, task, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setContentsMargins(8, 4, 4, 4)
         lay.setSpacing(2)
 
         top = QHBoxLayout()
@@ -44,8 +45,11 @@ class TaskRowWidget(QWidget):
         top.addWidget(self.title_label, 1)
         self.status_label = QLabel("排队中")
         top.addWidget(self.status_label)
-        self.cancel_btn = QPushButton("取消")
-        self.cancel_btn.setFixedWidth(56)
+        self.cancel_btn = QPushButton(" 取消 ")
+        self.cancel_btn.setFixedWidth(64)
+        self.cancel_btn.setStyleSheet(
+            "QPushButton { font-size: 13px; padding: 2px 6px; }"
+        )
         self.cancel_btn.clicked.connect(
             lambda: self.cancel_requested.emit(task.id))
         top.addWidget(self.cancel_btn)
@@ -192,6 +196,14 @@ class MainWindow(QMainWindow):
         self.add_profile_btn.setIcon(get_icon("plus", size=18, color="#a9b1d6"))
         self.add_profile_btn.clicked.connect(self._add_profile)
         toolbar_layout.addWidget(self.add_profile_btn)
+
+        self.del_profile_btn = QPushButton("")
+        self.del_profile_btn.setToolTip("删除当前环境")
+        self.del_profile_btn.setFixedSize(32, 32)
+        self.del_profile_btn.setObjectName("delProfileBtn")
+        self.del_profile_btn.setIcon(get_icon("trash-2", size=18, color="#a9b1d6"))
+        self.del_profile_btn.clicked.connect(self._delete_profile)
+        toolbar_layout.addWidget(self.del_profile_btn)
 
         toolbar_layout.addSpacing(12)
 
@@ -380,7 +392,7 @@ class MainWindow(QMainWindow):
         # 底部面板 — 任务列表 + 日志
         self._bottom_tabs = QTabWidget()
         self._bottom_tabs.setDocumentMode(True)
-        self._bottom_tabs.setMinimumHeight(48)  # 允许拉伸到很小
+        self._bottom_tabs.setMinimumHeight(100)  # 防止终端被过度挤压
 
         self.task_list = QListWidget()
         self._bottom_tabs.addTab(self.task_list, "任务")
@@ -392,6 +404,18 @@ class MainWindow(QMainWindow):
         self.log_view.document().setMaximumBlockCount(2000)
         self._bottom_tabs.addTab(self.log_view, "日志")
 
+        # 终端面板
+        self._terminal_mgr = TerminalManager(
+            config_provider=lambda: self._config,
+            tunnel_state_provider=self._tunnel_state,
+            parent=self,
+        )
+        self._terminal_mgr.terminal_count_changed.connect(
+            self._on_terminal_count_changed)
+        self._bottom_tabs.addTab(self._terminal_mgr, "终端")
+        # 初始状态: 终端标签页带计数
+        self._update_terminal_tab_label()
+
         # 主布局：工具栏 → 垂直分割器(双栏树 / 底部面板可上下拉伸)
         main_splitter = QSplitter(Qt.Vertical)
         main_splitter.addWidget(splitter)
@@ -399,6 +423,7 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(0, 1)
         main_splitter.setStretchFactor(1, 0)
         main_splitter.setCollapsible(0, False)  # 树面板不可完全折叠
+        main_splitter.setCollapsible(1, False)  # 底部面板不可完全折叠
         main_splitter.setSizes([620, 170])
         self._main_splitter = main_splitter
 
@@ -473,6 +498,9 @@ class MainWindow(QMainWindow):
         self.remote_tree.context_rename.connect(self._remote_context_rename)
         self.remote_tree.context_delete.connect(self._remote_context_delete)
         self.remote_tree.context_refresh.connect(self._remote_refresh_current)
+
+        # 底部标签页切换 → 终端 resize
+        self._bottom_tabs.currentChanged.connect(self._on_bottom_tab_changed)
 
     # ─── 导航 ─────────────────────────────────────────────────
 
@@ -642,11 +670,13 @@ class MainWindow(QMainWindow):
         self._set_local_root(os.path.expanduser("~"))
 
     def _local_refresh(self):
+        """刷新本地面板：强制 QFileSystemModel 重新读取磁盘"""
         path = self._local_model.filePath(
             self._local_proxy.mapToSource(self.local_tree.rootIndex())
         )
-        self._local_model.setRootPath("")  # 触发刷新
-        self._local_model.setRootPath(QDir.rootPath())
+        # 直接对当前路径调用 setRootPath 触发 model 重读该目录
+        # (QFileSystemModel 内部会重新 stat 该目录下的所有文件)
+        self._local_model.setRootPath(path)
         self._set_local_root(path)
 
     def _remote_go_up(self):
@@ -1125,18 +1155,22 @@ class MainWindow(QMainWindow):
 
         仅刷新传输目标目录（或当前路径栏目录作为回退），
         避免原本展开的树状结构瞬间闭合。
+
+        注意: 远程刷新是异步的(后台 fetch), 需要延迟 diff 更新等数据到达。
         """
         if direction == "push" and dest:
             self._refresh_remote_dir(dest)
+            # 远程刷新是异步的, 延迟 diff 更新以等待后台 fetch 完成
+            QTimer.singleShot(1500, self._update_diff_highlighting)
         elif direction == "pull" and dest:
             self._local_refresh()
+            self._update_diff_highlighting()
         else:
             if self._tunnel_connected:
                 path = self.remote_path_bar.text().strip()
                 if path:
                     self._refresh_remote_dir(path)
-
-        self._update_diff_highlighting()
+                    QTimer.singleShot(1500, self._update_diff_highlighting)
 
     # ─── 隧道管理 ─────────────────────────────────────────────
 
@@ -1204,6 +1238,7 @@ class MainWindow(QMainWindow):
         self.tunnel_status_label.setText("● 已连接")
         self.tunnel_status_label.setStyleSheet("color: #9ece6a;")
         self._update_tunnel_buttons()
+        self._on_tunnel_state_for_terminal()
         self._log(f"✓ 隧道已连接 (PID={self._tunnel_proc.pid})")
         self.status_bar.showMessage("隧道已连接 — 正在加载远程目录...", 3000)
 
@@ -1236,6 +1271,7 @@ class MainWindow(QMainWindow):
         self.tunnel_status_label.setText("● 未连接")
         self.tunnel_status_label.setStyleSheet("color: #f7768e;")
         self._update_tunnel_buttons()
+        self._on_tunnel_state_for_terminal()
         self._log("隧道已断开")
 
     def _update_tunnel_buttons(self):
@@ -1312,6 +1348,8 @@ class MainWindow(QMainWindow):
         mgr.switch_profile(name)
         self._reload_profile_combo()
         self._log(f"已创建并切换到环境「{name}」")
+        # 立即打开配置对话框，方便用户修改连接参数
+        self._open_config_dialog(profile_name=name)
 
     def _delete_profile(self):
         mgr = self._config_mgr
@@ -1329,8 +1367,8 @@ class MainWindow(QMainWindow):
         self._reload_profile_combo()
         self._log(f"已删除环境「{name}」, 当前环境「{mgr.current_profile}」")
 
-    def _open_config_dialog(self):
-        dlg = ConfigDialog(self._config, self)
+    def _open_config_dialog(self, profile_name: str = None):
+        dlg = ConfigDialog(self._config, self, profile_name=profile_name)
         if dlg.exec_() == QDialog.Accepted:
             new_config = dlg.get_config()
             self._config_mgr.save(new_config)
@@ -1351,13 +1389,16 @@ class MainWindow(QMainWindow):
     # ─── 字体缩放 ─────────────────────────────────────────────
 
     def _setup_shortcuts(self):
-        """注册 Ctrl+= 放大, Ctrl+- 缩小, F5 刷新远程当前目录"""
+        """注册 Ctrl+= 放大, Ctrl+- 缩小, F5 刷新远程当前目录,
+        Ctrl+Shift+` 切换终端面板"""
         zoom_in = QShortcut("Ctrl+=", self)
         zoom_in.activated.connect(self._zoom_in)
         zoom_out = QShortcut("Ctrl+-", self)
         zoom_out.activated.connect(self._zoom_out)
         f5 = QShortcut("F5", self)
         f5.activated.connect(self._remote_refresh_current)
+        term_shortcut = QShortcut("Ctrl+Shift+`", self)
+        term_shortcut.activated.connect(self._toggle_terminal_focus)
 
     def _zoom_in(self):
         self._zoom(+2)
@@ -1467,6 +1508,36 @@ class MainWindow(QMainWindow):
         self.local_tree.viewport().update()
         self.remote_tree.viewport().update()
 
+    # ─── 终端 ─────────────────────────────────────────────────
+
+    def _on_terminal_count_changed(self, count: int):
+        """终端数量变化 → 更新标签页标题"""
+        self._update_terminal_tab_label()
+
+    def _update_terminal_tab_label(self):
+        """更新底部「终端」标签页标题"""
+        count = self._terminal_mgr.terminal_count
+        self._bottom_tabs.setTabText(2, f"终端 ({count})" if count else "终端")
+
+    def _toggle_terminal_focus(self):
+        """快捷键: 切换到终端面板并聚焦当前终端"""
+        self._bottom_tabs.setCurrentIndex(2)  # 终端标签页
+        display = self._terminal_mgr.active_display()
+        if display:
+            display.setFocus()
+        else:
+            # 没有终端时自动创建本地终端
+            self._terminal_mgr.add_terminal(TERM_LOCAL)
+
+    def _on_bottom_tab_changed(self, index: int):
+        """底部标签页切换 → 若切换到终端, 通知 resize"""
+        if index == 2:
+            QTimer.singleShot(80, self._terminal_mgr.notify_resize)
+
+    def _on_tunnel_state_for_terminal(self):
+        """隧道状态变化 → 更新终端面板按钮"""
+        self._terminal_mgr.update_tunnel_state(self._tunnel_state())
+
     # ─── 日志 ─────────────────────────────────────────────────
 
     def _log(self, msg: str):
@@ -1478,11 +1549,20 @@ class MainWindow(QMainWindow):
 
     # ─── 生命周期 ─────────────────────────────────────────────
 
+    def resizeEvent(self, event):
+        """窗口 resize → 延迟通知终端面板重算尺寸 (等布局更新完成)"""
+        super().resizeEvent(event)
+        if hasattr(self, '_terminal_mgr'):
+            QTimer.singleShot(50, self._terminal_mgr.notify_resize)
+
     def closeEvent(self, event):
         # 保存窗口几何与分割器状态
         settings = QSettings("sshtool", "gui")
         settings.setValue("geometry", self.saveGeometry())
         settings.setValue("splitter_state", self._main_splitter.saveState())
+
+        # 关闭所有终端会话
+        self._terminal_mgr.close_all()
 
         # 取消进行中的隧道连接
         if self._connecting and self._connector:

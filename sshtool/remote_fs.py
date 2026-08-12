@@ -31,6 +31,7 @@ class RemoteFileSystemModel:
     """通过 SSH stat 懒加载远程目录树，获取完整文件信息"""
 
     COLUMNS = ["名称", "大小", "修改时间"]
+    MAX_CACHE_ENTRIES = 500  # 目录列表缓存上限, 超出后淘汰最旧
 
     # 入口数据结构: (name, is_dir, size, mtime)
     # mtime 为 Unix 时间戳(int)，0 表示未知
@@ -92,6 +93,8 @@ class RemoteFileSystemModel:
                                parent: Optional[QStandardItem] = None):
         """将已获取的列表填充到模型"""
         self._cache[path] = entries
+        if len(self._cache) > self.MAX_CACHE_ENTRIES:
+            del self._cache[next(iter(self._cache))]  # 淘汰最旧目录
         target = parent if parent else self.model.invisibleRootItem()
         dirs = sorted((e for e in entries if e[1]), key=lambda e: e[0].lower())
         files = sorted((e for e in entries if not e[1]),

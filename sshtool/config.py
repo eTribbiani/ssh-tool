@@ -10,7 +10,7 @@ CONFIG_DIR = Path.home() / ".config" / "sshtool"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG = {
-    "gw_host": "192.168.1.214",
+    "gw_host": "192.168.1.215",
     "gw_port": 60000,
     "gw_user": "bpx",
     "gw_pass": "bpx1024",
@@ -277,6 +277,42 @@ QTextEdit {{
     font-family: "DejaVu Sans Mono", "Cascadia Code", monospace;
     font-size: {s}px;
     selection-background-color: #364a82;
+}}
+
+/* ── 终端视图 ─────────────────────────────────────────── */
+QPlainTextEdit {{
+    background-color: #161720;
+    color: #c0caf5;
+    border: none;
+    font-family: "DejaVu Sans Mono", "Cascadia Code", monospace;
+    font-size: {s}px;
+    selection-background-color: #364a82;
+    selection-color: #e0e7ff;
+}}
+
+/* ── 终端列表面板 ────────────────────────────────────── */
+#terminalList QListWidget {{
+    background-color: #1a1b26;
+    color: #c0caf5;
+    border: none;
+    border-left: 1px solid #3b4261;
+    font-size: {s}px;
+    outline: none;
+}}
+#terminalList QListWidget::item {{
+    padding: 6px 8px;
+    border-bottom: 1px solid #24253b;
+}}
+#terminalList QListWidget::item:selected {{
+    background-color: #364a82;
+    color: #e0e7ff;
+}}
+#terminalList QListWidget::item:hover {{
+    background-color: #292e42;
+}}
+#terminalList QLabel {{
+    color: #a9b1d6;
+    font-size: {s}px;
 }}
 
 /* ── 状态栏 ───────────────────────────────────────────── */
