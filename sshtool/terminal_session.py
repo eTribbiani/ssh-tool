@@ -4,12 +4,12 @@ import os
 import signal
 import struct
 import subprocess
-import termios
 import time
-import tty
 
 import paramiko
 from PyQt5.QtCore import QThread, pyqtSignal
+
+from .platform_tools import IS_WINDOWS
 
 # ─── TerminalSession 基类 ─────────────────────────────────────
 
@@ -55,8 +55,8 @@ class TerminalSession(QThread):
 
 # ─── LocalTerminalSession ─────────────────────────────────────
 
-class LocalTerminalSession(TerminalSession):
-    """本地终端会话: 通过 PTY 运行 /bin/bash"""
+class PosixLocalTerminal(TerminalSession):
+    """本地终端会话 (POSIX): 通过 PTY 运行 /bin/bash"""
 
     def __init__(self, columns: int = 80, rows: int = 24, parent=None):
         super().__init__(columns, rows, parent)
@@ -151,6 +151,7 @@ class LocalTerminalSession(TerminalSession):
         if self._master_fd is not None:
             try:
                 winsize = struct.pack("HHHH", self._rows, self._columns, 0, 0)
+                import termios
                 fcntl = __import__("fcntl")
                 fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
             except Exception:
@@ -360,3 +361,16 @@ def make_gateway_session(config: dict, columns=80, rows=24, parent=None):
 # ─── 向后兼容别名 ─────────────────────────────────────────────
 
 RemoteTerminalSession = SSHTerminalSession  # 旧名称兼容
+
+
+# ─── 本地终端工厂: 按平台选择后端 ─────────────────────────────
+
+def LocalTerminalSession(columns: int = 80, rows: int = 24, parent=None):
+    """创建本地终端会话, 按平台选择 POSIX PTY 或 Windows ConPTY 后端。
+
+    保持原有调用签名 LocalTerminalSession(cols, rows, parent=...) 不变。
+    """
+    if IS_WINDOWS:
+        from .local_terminal_win import WinConPtyTerminal
+        return WinConPtyTerminal(columns, rows, parent)
+    return PosixLocalTerminal(columns, rows, parent)

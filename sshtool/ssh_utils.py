@@ -6,12 +6,14 @@ import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from .platform_tools import tool_msys_path, tool_path
+
 
 def ssh_base_args(cfg: dict, timeout: int = 5) -> list:
     """构造通过隧道连接 RK3588 的 ssh 基础参数"""
     return [
-        "sshpass", "-p", cfg["rk_pass"],
-        "ssh", "-p", str(cfg["tunnel_port"]),
+        tool_path("sshpass"), "-p", cfg["rk_pass"],
+        tool_msys_path("ssh"), "-p", str(cfg["tunnel_port"]),
         "-o", "StrictHostKeyChecking=no",
         "-o", f"ConnectTimeout={timeout}",
         f"{cfg['rk_user']}@127.0.0.1",
@@ -42,8 +44,8 @@ def check_tunnel(cfg: dict, timeout: int = 15) -> tuple:
 def open_tunnel(cfg: dict) -> subprocess.Popen:
     """建立本地 ↔ 网关 ↔ RK3588 的 SSH 隧道"""
     return subprocess.Popen([
-        "sshpass", "-p", cfg["gw_pass"],
-        "ssh", "-p", str(cfg["gw_port"]),
+        tool_path("sshpass"), "-p", cfg["gw_pass"],
+        tool_msys_path("ssh"), "-p", str(cfg["gw_port"]),
         "-o", "StrictHostKeyChecking=no",
         "-N", "-L", f"{cfg['tunnel_port']}:{cfg['rk_host']}:22",
         f"{cfg['gw_user']}@{cfg['gw_host']}",

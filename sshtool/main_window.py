@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .config import APP_NAME, ConfigManager, clamp_font, make_stylesheet
+from .platform_tools import IS_WINDOWS, tool_path
 from .dialogs import ConfigDialog, RsyncOptionsDialog, TransferPreviewDialog
 from .icons import get_icon
 from .remote_fs import RemoteFileSystemModel
@@ -1587,7 +1588,20 @@ class MainWindow(QMainWindow):
 # ===================================================================
 
 def _check_sshpass():
-    """检查 sshpass 是否已安装，缺失则弹出提示并退出"""
+    """检查 SSH 依赖工具是否可用，缺失则弹出提示并退出"""
+    if IS_WINDOWS:
+        # Windows: 检查捆绑工具链中的关键二进制
+        missing = [n for n in ("sshpass", "ssh", "rsync", "bash")
+                   if not os.path.exists(tool_path(n))]
+        if not missing:
+            return
+        QMessageBox.critical(
+            None, "缺少依赖",
+            "未找到捆绑的工具链文件：" + ", ".join(missing) + "\n\n"
+            "请确认发布目录中的 toolchain/ 目录完整。",
+        )
+        sys.exit(1)
+    # Linux: 检查 PATH 中的 sshpass
     if shutil.which("sshpass"):
         return
     QMessageBox.critical(

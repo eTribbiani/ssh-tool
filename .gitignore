@@ -11,3 +11,6 @@ config.json
 # PyInstaller 打包产物
 build/
 dist/
+
+# 工具链构建产物 (由 build_toolchain.py 生成)
+toolchain/

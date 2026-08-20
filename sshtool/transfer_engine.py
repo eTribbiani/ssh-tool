@@ -6,6 +6,7 @@ from typing import Iterable
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from .platform_tools import IS_WINDOWS, sh_quote, to_msys_path, tool_path
 from .rsync_options import RsyncOptions
 from .ssh_utils import check_tunnel, direction_text
 
@@ -145,14 +146,22 @@ class TransferEngine(QThread):
 
         self._emit_log(f"[rsync] {'预览模式' if self.dry_run else '开始同步'}...")
 
-        ssh_cmd = (
-            f"sshpass -p '{cfg['rk_pass']}' ssh -p {cfg['tunnel_port']} "
-            f"-o StrictHostKeyChecking=no"
-        )
+        if IS_WINDOWS:
+            sshpass = sh_quote(to_msys_path(tool_path("sshpass")))
+            ssh = sh_quote(to_msys_path(tool_path("ssh")))
+            ssh_cmd = (
+                f"{sshpass} -p {sh_quote(cfg['rk_pass'])} {ssh} "
+                f"-p {cfg['tunnel_port']} -o StrictHostKeyChecking=no"
+            )
+        else:
+            ssh_cmd = (
+                f"sshpass -p '{cfg['rk_pass']}' ssh -p {cfg['tunnel_port']} "
+                f"-o StrictHostKeyChecking=no"
+            )
 
         # --outbuf=L: rsync 行缓冲输出, 每条进度即时刷新, 避免 stdio 整块缓冲
         # 导致进度"长时间卡死, 然后瞬间 100%" (需 rsync >= 3.1.0)
-        rsync_args = ["rsync", "--outbuf=L"] + self.rsync_opts.to_args()
+        rsync_args = [tool_path("rsync"), "--outbuf=L"] + self.rsync_opts.to_args()
         if self.dry_run:
             rsync_args.append("--dry-run")
             rsync_args.append("-i")  # --itemize-changes: 输出逐文件变更详情
@@ -160,12 +169,12 @@ class TransferEngine(QThread):
 
         if self.direction == "push":
             for src in self.sources:
-                rsync_args.append(src)
+                rsync_args.append(to_msys_path(src))
             rsync_args.append(f"{cfg['rk_user']}@127.0.0.1:{self.dest}")
         else:
             for src in self.sources:
                 rsync_args.append(f"{cfg['rk_user']}@127.0.0.1:{src}")
-            rsync_args.append(self.dest)
+            rsync_args.append(to_msys_path(self.dest))
 
         # 打印安全命令（隐藏密码）
         safe = [
