@@ -1,5 +1,7 @@
 """TerminalDisplay — PyQt5 终端渲染控件 (基于 pyte 0.8.x 终端仿真)"""
 
+from collections import deque
+
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QBrush, QColor, QFont, QKeyEvent, QPalette, QTextCharFormat,
@@ -40,6 +42,12 @@ TERMINAL_BG = "#161720"   # 最深底色
 TERMINAL_FG = "#c0caf5"   # 主文字色
 CURSOR_COLOR = "#7aa2f7"  # 光标色
 
+_SCROLL_EPSILON = 1  # px; 判断"用户是否已滚动到底部"的容差
+
+# 滚动回看行数上限。xterm.js 默认 1000; QPlainTextEdit 每行带格式,
+# 行数过大 (5000+) 会在持续日志输出时明显卡顿。1000 是均衡值。
+SCROLLBACK_LINES = 1000
+
 
 # ─── TerminalDisplay ──────────────────────────────────────────
 
@@ -63,13 +71,24 @@ class TerminalDisplay(QPlainTextEdit):
         self._rows = rows
 
         # ── pyte 终端仿真器 (GUI 线程, pyte 0.8.x 使用字符串) ──
-        self._screen = pyte.HistoryScreen(columns, rows, history=5000)
+        self._screen = pyte.HistoryScreen(columns, rows, history=SCROLLBACK_LINES)
         self._screen.cursor.hidden = False
         self._stream = pyte.Stream(self._screen)
 
         # ── 渲染状态 ──
         self._render_scheduled = False
         self._prev_display: list[str] = []
+
+        # ── scrollback 历史行渲染缓存 ──
+        # pyte.HistoryScreen 把滚出屏幕的行存入 history.top (deque, 最旧→最新),
+        # 但它们不在 screen.display 中。这里用 deque 缓存历史行的文本与行对象,
+        # 与 history.top 同步 (同样 maxlen, 满时自动挤出最旧行), 避免每帧重拼。
+        self._history_text = deque()  # 与 history.top 一一对应的文本
+        self._history_objs = deque()  # 与 history.top 一一对应的行对象
+        self._cache_cols: int = self._columns  # 缓存对应的列宽 (列宽变化需重拼)
+        self._history_dirty: bool = True     # 历史区需整体重写 (列宽变化/清空)
+        self._dropped_history: int = 0       # 本轮从文档前端需删除的 block 数
+        self._scroll_on_input: bool = False  # 用户按键输入后, 下次渲染滚动到底部
 
         # ── 外观 ──
         self.setFont(QFont("DejaVu Sans Mono", 13))
@@ -151,6 +170,8 @@ class TerminalDisplay(QPlainTextEdit):
         self._rows = max(4, rows)
         # 注意: pyte Screen.resize(lines, columns) — 行在前, 列在后!
         self._screen.resize(self._rows, self._columns)
+        # 历史行缓存按 _cache_cols 校验: 列宽变化时在 _build_rows 中自动重拼,
+        # 仅行数变化不影响缓存。SCREEN 上的删除/增长由 _render 的块数判断处理。
         self._schedule_render()
 
     # ─── 渲染 ───────────────────────────────────────────────────
@@ -161,73 +182,175 @@ class TerminalDisplay(QPlainTextEdit):
             self._render_scheduled = True
             QTimer.singleShot(0, self._render)
 
+    def _build_rows(self):
+        """合并 scrollback 历史与当前屏幕, 返回 (text_rows, row_objs)。
+
+        text_rows[i] 与 row_objs[i] 一一对应:
+          - i < len(history.top): 历史行 (最旧→最新), 行对象为 StaticDefaultDict[int, Char]
+          - i >= len(history.top): 当前屏幕行 (screen.buffer[y])
+        row_objs 供渲染时查询各字符的 ANSI 颜色属性。
+
+        历史行缓存与 history.top 增量同步 (O(新增行 + 被挤出行)):
+          - 列宽变化 / 历史清空 → 全量重拼 + 置 _history_dirty (触发整体重建)
+          - 其余 → 弹出被 deque 挤出的最旧行 (计入 _dropped_history, 由 _render
+            删除文档前端对应 block), 并追加新增行。满量旋转因此只删/增少量 block,
+            而非每行触发一次数千 block 的全量重建。
+        """
+        screen = self._screen
+        cols = screen.columns
+        history = screen.history.top
+        hlen = len(history)
+
+        dropped = 0
+        if self._cache_cols != cols:
+            # 列宽变化 (窗口 resize / DECCOLM) → 全量重拼 + 整体重建
+            self._history_text = deque(
+                "".join(row[x].data for x in range(cols)) for row in history
+            )
+            self._history_objs = deque(history)
+            self._cache_cols = cols
+            self._history_dirty = True
+        elif not history:
+            # 历史被清空 (ESC[3J / reset) → 文档中残留的历史 block 需清除
+            if self._history_objs:
+                self._history_text.clear()
+                self._history_objs.clear()
+                self._history_dirty = True
+        else:
+            # 增量同步: 弹出被挤出的最旧行 (首元素身份变化即被替换)
+            while self._history_objs and self._history_objs[0] is not history[0]:
+                self._history_text.popleft()
+                self._history_objs.popleft()
+                dropped += 1
+
+            if not self._history_objs and history:
+                # 缓存被完全弹出仍未与 history 重叠 → 本批次滚动量超过已有历史,
+                # 新旧内容整体替换。增量前移无法正确对齐, 改为全量重拼 + 整体重建。
+                self._history_text = deque(
+                    "".join(row[x].data for x in range(cols)) for row in history
+                )
+                self._history_objs = deque(history)
+                self._history_dirty = True
+                dropped = 0
+            else:
+                # 追加新增行 (一次滚动可能多行)
+                idx = len(self._history_objs)
+                while idx < hlen:
+                    row = history[idx]
+                    self._history_objs.append(row)
+                    self._history_text.append(
+                        "".join(row[x].data for x in range(cols))
+                    )
+                    idx += 1
+
+        self._dropped_history = dropped
+
+        # 屏幕区文本用 pyte 自带渲染器 (正确处理宽字符 stub),
+        # 历史区用朴素 join (stub 的 data 为空, 不影响结果)。
+        screen_text = screen.display
+        screen_objs = [screen.buffer[y] for y in range(screen.lines)]
+
+        return list(self._history_text) + screen_text, \
+            list(self._history_objs) + screen_objs
+
     def _render(self):
         """将 pyte.Screen 渲染到 QPlainTextEdit (增量 + 批处理)"""
         self._render_scheduled = False
 
         screen = self._screen
-        display = screen.display
+        rows, row_objs = self._build_rows()
         cursor_x, cursor_y = screen.cursor.x, screen.cursor.y
 
+        # 在修改文档前记录"是否已滚动到底部", 避免追加 block 后 maximum 变化导致误判
+        vbar = self.verticalScrollBar()
+        at_bottom = vbar.value() >= vbar.maximum() - _SCROLL_EPSILON
+
         # 快速检查: 内容未变化时跳过
-        if display == self._prev_display:
+        if rows == self._prev_display:
             self._update_cursor_block(cursor_y, cursor_x)
             return
-        self._prev_display = list(display)
+        self._prev_display = rows
 
         doc = self.document()
         current_blocks = doc.blockCount()
-        target_blocks = len(display)
+        target_blocks = len(rows)
 
-        # ── 块数不匹配 (resize / 初次渲染) → 全量重建 ──
-        if current_blocks != target_blocks:
-            self._full_rebuild(doc, display, screen)
+        # 全量重建用于: 首次渲染 / 内容缩短 (resize 变矮、历史被清空) /
+        # 历史缓存整体失效 (列宽变化)。增长 (正常滚动/历史堆积) 走增量路径。
+        if (current_blocks == 0 or current_blocks > target_blocks
+                or self._history_dirty):
+            self._full_rebuild(doc, rows, row_objs)
+            self._history_dirty = False
+            self._dropped_history = 0
         else:
-            self._incremental_update(doc, display, screen)
+            # 历史满后被挤出最旧行 → 删除文档前端对应 block (自动前移中间行),
+            # 再由增量更新在末尾追加新行。避免每行触发全量重建。
+            if self._dropped_history > 0:
+                self._delete_leading_blocks(doc, self._dropped_history)
+                self._dropped_history = 0
+            self._incremental_update(doc, rows, row_objs)
 
-        # ── 滚动到光标所在行 ──
-        self._scroll_to_cursor(cursor_y)
+        # ── 位于底部 或 刚按键输入 (scrollOnUserInput) → 跟随滚动到底部;
+        #    否则保留用户上滚的位置 ──
+        self._scroll_to_cursor(cursor_y, at_bottom or self._scroll_on_input)
+        self._scroll_on_input = False
         self._update_cursor_block(cursor_y, cursor_x)
 
-    def _full_rebuild(self, doc, display, screen):
-        """全量重建 (仅 resize 或首次渲染时使用)"""
+    def _delete_leading_blocks(self, doc, count):
+        """删除文档前 count 个 block (历史满后最旧行被挤出时前移中间行)。
+
+        一次 begin/endEditBlock 内批量删除, Qt 仅触发一次 layout。
+        """
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        for _ in range(count):
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(QTextCursor.StartOfBlock)
+            cursor.movePosition(QTextCursor.NextBlock, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+        cursor.endEditBlock()
+
+    def _full_rebuild(self, doc, rows, row_objs):
+        """全量重建 (仅 resize 变矮 / 首次渲染 / 历史被清空时使用)"""
         doc.clear()
         cursor = QTextCursor(doc)
         cursor.beginEditBlock()
-        for row, line_text in enumerate(display):
-            self._write_line(cursor, row, line_text, screen, row)
+        for i, line_text in enumerate(rows):
+            self._write_line(cursor, i, line_text, row_objs[i])
         cursor.endEditBlock()
 
-    def _incremental_update(self, doc, display, screen):
-        """增量更新: 只重写变化的行, 所有插入合并为一次 layout"""
+    def _incremental_update(self, doc, rows, row_objs):
+        """增量更新: 补齐末尾缺失 block, 再重写屏幕区变化的行。
+
+        调用前提: 文档中 block 0..(blockCount-1) 与 rows 对应位置已一致
+        (历史满后由 _delete_leading_blocks 删除被挤出的前端 block 保证)。故只需:
+          1) 末尾补齐缺失 block —— 一次批次可能滚动多行, 历史与屏幕同时增长,
+             缺失数 = len(rows) - blockCount, 缺几个补几个;
+          2) 重写屏幕区内容变化的 block —— 就地编辑 (进度条 / 光标回写 / 覆盖),
+             不改变 block 数。
+        """
         cursor = QTextCursor(doc)
         cursor.beginEditBlock()
 
-        for row, line_text in enumerate(display):
-            block = doc.findBlockByNumber(row)
-            if not block.isValid():
-                # 不应发生, 但防御: 追加新 block
-                cursor.movePosition(QTextCursor.End)
-                cursor.insertBlock()
-                cursor.insertText(line_text)
-                continue
+        # 1) 末尾补齐缺失 block (用带颜色的写入器)
+        n = doc.blockCount()
+        while n < len(rows):
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertBlock()
+            self._write_line_at_cursor(cursor, rows[n], row_objs[n])
+            n += 1
 
-            old_text = block.text()
-            if old_text == line_text:
-                continue  # 该行未变, 跳过
-
-            # 就地替换该行内容
-            cursor.setPosition(block.position())
-            cursor.movePosition(QTextCursor.StartOfBlock)
-            cursor.movePosition(QTextCursor.EndOfBlock,
-                               QTextCursor.KeepAnchor)
-
-            # 逐字符写入 (保留 ANSI 颜色属性)
-            self._write_line_at_cursor(cursor, line_text, screen, row)
+        # 2) 重写屏幕区内容变化的 block (历史行内容不随滚动变化, 无需处理)
+        start = len(self._screen.history.top)
+        for i in range(start, len(rows)):
+            block = doc.findBlockByNumber(i)
+            if block.isValid() and block.text() != rows[i]:
+                cursor.setPosition(block.position())
+                self._write_line_at_cursor(cursor, rows[i], row_objs[i])
 
         cursor.endEditBlock()
 
-    def _write_line_at_cursor(self, cursor, line_text, screen, screen_row):
+    def _write_line_at_cursor(self, cursor, line_text, row_obj):
         """在当前位置写入一行 (替换原有内容), 不插入新 block"""
         default_fmt = QTextCharFormat()
         default_fmt.setForeground(QColor(TERMINAL_FG))
@@ -239,25 +362,20 @@ class TerminalDisplay(QPlainTextEdit):
         cursor.removeSelectedText()
 
         for col, char in enumerate(line_text):
-            try:
-                sc = screen.buffer[screen_row][col]
-            except (KeyError, IndexError):
-                sc = None
+            # row_obj 是 StaticDefaultDict[int, Char], 缺列返回 default_char
+            sc = row_obj[col]
 
-            if sc is not None:
-                if (sc.fg == "default" and sc.bg == "default"
-                        and not sc.bold and not sc.italics
-                        and not sc.underscore and not sc.reverse):
-                    char_fmt = default_fmt
-                else:
-                    char_fmt = self._make_format(sc)
-            else:
+            if (sc.fg == "default" and sc.bg == "default"
+                    and not sc.bold and not sc.italics
+                    and not sc.underscore and not sc.reverse):
                 char_fmt = default_fmt
+            else:
+                char_fmt = self._make_format(sc)
 
             cursor.insertText(char, char_fmt)
 
     def _write_line(self, cursor: QTextCursor, display_row: int,
-                    line_text: str, screen: pyte.Screen, screen_row: int):
+                    line_text: str, row_obj):
         """写入一行文本, 应用 ANSI 颜色/属性"""
         if display_row > 0:
             cursor.insertBlock()
@@ -266,22 +384,16 @@ class TerminalDisplay(QPlainTextEdit):
         default_fmt.setForeground(QColor(TERMINAL_FG))
 
         for col, char in enumerate(line_text):
-            # 查询 pyte 缓冲区中的字符属性
-            try:
-                sc = screen.buffer[screen_row][col]
-            except (KeyError, IndexError):
-                sc = None
+            # row_obj 是 StaticDefaultDict[int, Char], 缺列返回 default_char
+            sc = row_obj[col]
 
-            if sc is not None:
-                # 检查是否是默认格式 (无特殊属性)
-                if (sc.fg == "default" and sc.bg == "default"
-                        and not sc.bold and not sc.italics
-                        and not sc.underscore and not sc.reverse):
-                    char_fmt = default_fmt
-                else:
-                    char_fmt = self._make_format(sc)
-            else:
+            # 检查是否是默认格式 (无特殊属性)
+            if (sc.fg == "default" and sc.bg == "default"
+                    and not sc.bold and not sc.italics
+                    and not sc.underscore and not sc.reverse):
                 char_fmt = default_fmt
+            else:
+                char_fmt = self._make_format(sc)
 
             cursor.insertText(char, char_fmt)
 
@@ -325,12 +437,18 @@ class TerminalDisplay(QPlainTextEdit):
 
         return fmt
 
-    def _scroll_to_cursor(self, cursor_row: int):
-        """滚动确保光标所在行可见"""
-        # cursor_row 是 screen 坐标 (不含 scrollback history offset)
-        # 在 display 中的行 = display 总行数 - screen 行数 + cursor_row
-        display = self._screen.display
-        history_rows = len(display) - self._screen.lines
+    def _scroll_to_cursor(self, cursor_row: int, at_bottom: bool):
+        """仅当用户已位于底部时跟随输出, 钉住视图底部; 否则保留其滚动位置。
+
+        at_bottom 在 _render 修改文档前捕获; 上滚查看历史时返回,
+        不打断用户阅读 (新输出只会追加到文档末尾, 已有 block 索引不变,
+        视图自然保持原位)。
+        """
+        if not at_bottom:
+            return
+
+        # cursor_row 是 screen 坐标; 文档中对应行 = 历史行数 + cursor_row
+        history_rows = len(self._screen.history.top)
         target = history_rows + cursor_row
 
         # 获取光标在文档中的 block
@@ -338,7 +456,9 @@ class TerminalDisplay(QPlainTextEdit):
         if block.isValid():
             cursor = QTextCursor(block)
             self.setTextCursor(cursor)
-            self.ensureCursorVisible()
+            # 钉在底部: 视口始终显示最新一屏 (含光标下方的空行), 且每帧
+            # 都回到 maximum, 保证"位于底部"状态在持续输出时不漂移。
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
     def _update_cursor_block(self, row: int, col: int):
         """更新光标指示块"""
@@ -351,8 +471,7 @@ class TerminalDisplay(QPlainTextEdit):
 
         if self._cursor_block and self._cursor_visible:
             row, col = self._cursor_block
-            display = self._screen.display
-            history_rows = len(display) - self._screen.lines
+            history_rows = len(self._screen.history.top)
             target = history_rows + row
 
             block = self.document().findBlockByNumber(max(0, target))
@@ -376,6 +495,15 @@ class TerminalDisplay(QPlainTextEdit):
 
     # ─── 键盘输入处理 ─────────────────────────────────────────
 
+    def _emit_input(self, data: bytes):
+        """发送用户输入; 标记下次渲染滚动到底部 (scrollOnUserInput)。
+
+        标准终端行为: 用户敲命令时即使此前上滚查看日志, 也应回到底部
+        显示其输入与回显。故输入后置位 _scroll_on_input, 由 _render 消费。
+        """
+        self._scroll_on_input = True
+        self.input_data.emit(data)
+
     def keyPressEvent(self, event: QKeyEvent):
         """拦截所有键盘输入并转换为终端转义序列"""
         text = event.text()
@@ -386,7 +514,7 @@ class TerminalDisplay(QPlainTextEdit):
         if modifiers == Qt.ControlModifier:
             data = self._ctrl_key(key)
             if data is not None:
-                self.input_data.emit(data)
+                self._emit_input(data)
                 return
 
         # ── Shift+Ctrl 组合 ──
@@ -400,13 +528,13 @@ class TerminalDisplay(QPlainTextEdit):
 
         # ── 特殊键 ──
         if key in _KEY_TO_SEQUENCE:
-            self.input_data.emit(_KEY_TO_SEQUENCE[key])
+            self._emit_input(_KEY_TO_SEQUENCE[key])
             return
 
         # ── 普通文本 ──
         if text and not (modifiers & (Qt.ControlModifier | Qt.AltModifier
                                       | Qt.MetaModifier)):
-            self.input_data.emit(text.encode("utf-8"))
+            self._emit_input(text.encode("utf-8"))
             return
 
     def _ctrl_key(self, key: int) -> bytes | None:
@@ -433,7 +561,7 @@ class TerminalDisplay(QPlainTextEdit):
         clipboard = QApplication.clipboard()
         text = clipboard.text()
         if text:
-            self.input_data.emit(text.encode("utf-8"))
+            self._emit_input(text.encode("utf-8"))
 
     def contextMenuEvent(self, event):
         """右键菜单: 复制 / 粘贴 / 全选 / 清屏 / 终止"""
@@ -469,7 +597,7 @@ class TerminalDisplay(QPlainTextEdit):
 
     def _clear_screen(self):
         """发送 Ctrl+L 清屏"""
-        self.input_data.emit(b"\x0c")
+        self._emit_input(b"\x0c")
 
     def _request_terminate(self):
         """请求终止当前终端会话"""
